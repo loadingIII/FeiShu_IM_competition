@@ -1,0 +1,8 @@
+langgraph>=0.2.0
+langchain>=0.2.0
+langchain-community>=0.2.0
+python-pptx>=0.6.23
+aiohttp>=3.9.0
+pydantic>=2.6.0
+python-dotenv>=1.0.0
+uuid>=1.30
