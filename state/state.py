@@ -43,3 +43,7 @@ class IMState(TypedDict):
     confirmed: Annotated[bool, last_value]  # 用户确认结果：同意执行时为True
     cancelled: Annotated[bool, last_value]  # 用户确认结果：取消任务时为True
     error: Annotated[Optional[str], last_value]  # 异常信息存储：节点执行出错时写入
+
+    # 任务规划相关（用于重新规划时传递上下文）
+    plan_feedback: Annotated[Optional[str], last_value]  # 用户对计划的修改意见
+    previous_plan: Annotated[Optional[Dict], last_value]  # 之前的任务计划，用于重新规划时参考

@@ -12,8 +12,9 @@ if __name__ == "__main__":
     initial_state = {
         "workflow_id": str(uuid.uuid4()),
         "user_id": "user_123",
-        "user_input": "@Agent-Pilot 整理昨天的产品评审会议纪要并生成汇报PPT",
+        "user_input": "@Agent-Pilot 帮我将今天的群消息总结成一个文档",
         "source": "feishu_im",
+        "chat_id": "oc_81881e331cd9d7f921771aa884b96742",
         "intent": None,
         "chat_context": "",
         "task_plan": None,
@@ -53,7 +54,11 @@ if __name__ == "__main__":
         print(f"工作流ID: {result['workflow_id']}")
         print(f"最终状态: {result['current_scene']}")
         print("\n产出物:")
-        for artifact in result["delivery"]["artifacts"]:
-            print(f"- {artifact['title']}: {artifact['url']}")
+        delivery = result.get("delivery")
+        if delivery and "artifacts" in delivery:
+            for artifact in delivery["artifacts"]:
+                print(f"- {artifact['title']}: {artifact['url']}")
+        else:
+            print("- 无产出物（工作流可能未执行到交付环节）")
     
     asyncio.run(run_workflow())
