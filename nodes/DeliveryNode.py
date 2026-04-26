@@ -21,12 +21,20 @@ async def delivery_node(state: IMState) -> IMState:
             "url": state["ppt_url"]
         })
 
+    # 安全获取主题
+    intent = state.get("intent", {})
+    topic = intent.get("topic", "任务") if intent else "任务"
+    
+    # 安全获取任务计划
+    task_plan = state.get("task_plan", {})
+    branches = task_plan.get("branches", []) if task_plan else []
+    
     delivery = {
-        "summary": f"已完成{state['intent']['topic']}相关任务",
+        "summary": f"已完成{topic}相关任务",
         "artifacts": artifacts,
-        "workflow_id": state["workflow_id"],
+        "workflow_id": state.get("workflow_id", ""),
         "completed_branches": len(artifacts),
-        "total_branches": len(state["task_plan"]["branches"])
+        "total_branches": len(branches)
     }
     state["delivery"] = delivery
 

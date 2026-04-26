@@ -12,7 +12,7 @@ if __name__ == "__main__":
     initial_state = {
         "workflow_id": str(uuid.uuid4()),
         "user_id": "user_123",
-        "user_input": "@Agent-Pilot 帮我将今天的群消息总结成一个文档",
+        "user_input": "@Agent-Pilot 帮我总结一下本周的群聊内容,不用生成文档,只生成一个PPT",
         "source": "feishu_im",
         "chat_id": "oc_81881e331cd9d7f921771aa884b96742",
         "intent": None,
@@ -28,7 +28,7 @@ if __name__ == "__main__":
         "messages": [],
         "current_scene": "",
         "need_confirm": False,
-        "confirmed": True,  # 示例默认确认，跳过确认步骤
+        "confirmed": False,  # 等待用户确认
         "cancelled": False,
         "error": None
     }

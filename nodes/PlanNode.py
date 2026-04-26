@@ -79,13 +79,13 @@ async def plan_node(state: IMState) -> IMState:
     # 由用户在确认环节人工检查任务计划的合理性
 
     state["task_plan"] = task_plan
+    state["current_scene_before_confirm"] = "plan_node"  # 记录来源，用于ConfirmNode路由
     state["need_confirm"] = True
     
     # 清理反馈信息（避免影响下次规划）
-    if "plan_feedback" in state:
-        del state["plan_feedback"]
-    if "previous_plan" in state:
-        del state["previous_plan"]
+    # 使用 pop 方法避免 TypedDict 删除警告
+    state.pop("plan_feedback", None)
+    state.pop("previous_plan", None)
     
     state["messages"].append("[plan_node] 任务规划完成，等待用户确认")
     return state

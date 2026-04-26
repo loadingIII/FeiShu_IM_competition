@@ -138,4 +138,66 @@ class FeishuAPI:
                 else:
                     raise Exception(f"拉取群聊历史失败: {error_msg} (错误码: {error_code})")
 
+    async def create_document(self, title: str, folder_token: str = None) -> dict:
+        """创建飞书文档
+        
+        Args:
+            title: 文档标题
+            folder_token: 可选的文件夹token
+            
+        Returns:
+            包含 document_id 的文档信息
+            
+        Raises:
+            Exception: 创建失败时抛出异常
+        """
+        token = await self.get_tenant_access_token()
+        url = "https://open.feishu.cn/open-apis/docx/v1/documents"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8"
+        }
+        payload = {"title": title}
+        if folder_token:
+            payload["folder_token"] = folder_token
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json=payload, headers=headers)
+            data = response.json()
+            if data.get("code") == 0:
+                return data["data"]["document"]
+            else:
+                raise Exception(f"创建飞书文档失败: {data.get('msg')} (错误码: {data.get('code')})")
+
+    async def create_document_blocks(self, document_id: str, block_id: str, children: list) -> dict:
+        """在文档中创建内容块
+        
+        Args:
+            document_id: 文档ID
+            block_id: 父块ID（使用document_id表示根节点）
+            children: 子块列表，每次最多50个
+            
+        Returns:
+            创建结果
+            
+        Raises:
+            Exception: 创建失败时抛出异常
+        """
+        token = await self.get_tenant_access_token()
+        url = f"https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks/{block_id}/children"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8"
+        }
+        payload = {"children": children}
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json=payload, headers=headers)
+            data = response.json()
+            if data.get("code") == 0:
+                return data["data"]
+            else:
+                raise Exception(f"创建文档块失败: {data.get('msg')} (错误码: {data.get('code')})")
+
+
 feishu_api = FeishuAPI()
