@@ -49,52 +49,93 @@ def format_doc_outline(doc_outline: dict) -> str:
     return "\n".join(lines)
 
 
-def format_ppt_outline(ppt_structure: dict) -> str:
+def format_ppt_outline(ppt_outline: dict) -> str:
     """格式化PPT大纲为易读的文本"""
     lines = []
-    lines.append("=" * 50)
-    lines.append(f"[PPT标题] {ppt_structure.get('title', 'N/A')}")
-    lines.append(f"[PPT类型] {ppt_structure.get('ppt_type', 'N/A')}")
-    lines.append(f"[PPT风格] {ppt_structure.get('ppt_style', 'business_blue')}")
-    lines.append("=" * 50)
+    lines.append("=" * 60)
+    lines.append(f"[PPT标题] {ppt_outline.get('title', 'N/A')}")
+    lines.append(f"[PPT类型] {ppt_outline.get('ppt_type', 'N/A')}")
+    lines.append(f"[总页数] {ppt_outline.get('total_pages', 'N/A')}")
+    lines.append("=" * 60)
     
-    lines.append("\n[PPT结构]")
-    slides = ppt_structure.get('slides', [])
+    lines.append("\n[页面结构]")
+    slides = ppt_outline.get('slides', [])
     for slide in slides:
-        page = slide.get('page', 0)
+        page_num = slide.get('page_number', '?')
         slide_type = slide.get('type', 'content')
         title = slide.get('title', '未命名页面')
+        layout = slide.get('layout', '-')
         
         type_emoji = {
-            'cover': '📘',
-            'agenda': '📋',
+            'cover': '📔',
+            'table_of_contents': '📋',
             'content': '📝',
-            'summary': '✅',
-            'ending': '🎉'
+            'section_divider': '🔖',
+            'final': '🎉'
         }.get(slide_type, '📄')
         
-        lines.append(f"  {type_emoji} 第{page}页 [{slide_type}] {title}")
+        lines.append(f"  {type_emoji} 第{page_num}页 [{slide_type}] {title}")
         
-        if slide_type in ['agenda', 'content', 'summary']:
-            points = slide.get('points', [])
-            for point in points:
+        content = slide.get('content', [])
+        if content and slide_type == 'content':
+            for point in content:
                 lines.append(f"     • {point}")
         
-        if slide.get('subtitle'):
-            lines.append(f"     副标题: {slide['subtitle']}")
+        visual_note = slide.get('visual_note', '')
+        if visual_note:
+            lines.append(f"     💡 视觉建议: {visual_note}")
+        
+        lines.append("")
     
-    lines.append("=" * 50)
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
+def format_ppt_content(ppt_content: dict) -> str:
+    """格式化PPT内容为易读的文本摘要"""
+    lines = []
+    lines.append("=" * 60)
+    lines.append(f"[PPT标题] {ppt_content.get('title', 'N/A')}")
+    lines.append(f"[总页数] {ppt_content.get('total_pages', 'N/A')}")
+    lines.append("=" * 60)
+    
+    slides = ppt_content.get('slides', [])
+    for slide in slides:
+        page_num = slide.get('page_number', '?')
+        title = slide.get('title', '未命名页面')
+        slide_type = slide.get('type', 'content')
+        
+        type_emoji = {
+            'cover': '📔',
+            'table_of_contents': '📋',
+            'content': '📝',
+            'section_divider': '🔖',
+            'final': '🎉'
+        }.get(slide_type, '📄')
+        
+        lines.append(f"\n{type_emoji} 第{page_num}页: {title}")
+        
+        bullets = slide.get('bullets', [])
+        if bullets:
+            for bullet in bullets:
+                lines.append(f"   • {bullet}")
+        
+        subtitle = slide.get('subtitle', '')
+        if subtitle:
+            lines.append(f"   副标题: {subtitle}")
+    
+    lines.append("\n" + "=" * 60)
     return "\n".join(lines)
 
 
 async def confirm_node(state: IMState) -> IMState:
     """通用确认等待节点 - 命令行交互版本
     
-    支持四种确认场景:
-    1. 任务计划确认 (task_plan)
+    支持以下确认场景:
+    1. 任务计划确认 (plan)
     2. 文档大纲确认 (doc_outline)
-    3. PPT风格选择 (style_selection)
-    4. PPT大纲确认 (ppt_structure)
+    3. PPT大纲确认 (ppt_outline)
+    4. PPT内容确认 (ppt_content)
     """
     logger.info("[confirm_node] 进入确认节点")
     state["current_scene"] = "confirm_node"
@@ -103,176 +144,43 @@ async def confirm_node(state: IMState) -> IMState:
     # 判断当前需要确认的内容
     task_plan = state.get("task_plan")
     doc_outline = state.get("doc_outline")
-    ppt_structure = state.get("ppt_structure")
+    ppt_outline = state.get("ppt_outline")
+    ppt_content = state.get("ppt_content")
     current_scene = state.get("current_scene_before_confirm", "")
     confirm_type = state.get("confirm_type", "")
     
-    # Step 1: 处理PPT风格选择
-    # 注意：当从plan_node进入且需要生成PPT时，也应该显示风格选择
-    if (confirm_type == "style_selection" and current_scene == "ppt_generate_node") or \
-       (current_scene == "ppt_generate_node" and not state.get("ppt_style_confirmed")):
-        # PPT风格选择模式
-        from nodes.PPTGenerateNode import format_style_selection, parse_style_selection, PPT_STYLE_OPTIONS
-        
-        print("\n" + format_style_selection())
-        
-        while True:
-            try:
-                user_input = input("\n请输入您的选择: ").strip()
-                
-                style_key, is_valid, message = parse_style_selection(user_input)
-                
-                if message == "cancelled":
-                    state["cancelled"] = True
-                    state["need_confirm"] = False
-                    state["messages"].append("[confirm_node] 用户取消PPT生成")
-                    print("[已取消] 任务结束")
-                    return state
-                
-                if is_valid:
-                    if style_key == "auto":
-                        # 自动推荐，让PPTGenerateNode自己决定
-                        state["ppt_style_selected"] = None
-                        state["ppt_style_confirmed"] = True
-                    else:
-                        state["ppt_style_selected"] = style_key
-                        state["ppt_style_confirmed"] = True
-                    
-                    state["confirmed"] = True
-                    state["need_confirm"] = False
-                    state["messages"].append(f"[confirm_node] 用户选择PPT风格: {message}")
-                    print(f"[已选择] {message}")
-                    return state
-                else:
-                    print(f"[错误] {message}")
-                    print("请重新输入，或输入 'cancel' 取消")
-                    
-            except (EOFError, KeyboardInterrupt):
-                # 非交互环境，自动选择
-                print("\n[警告] 检测到非交互环境，自动选择商务蓝风格")
-                state["ppt_style_selected"] = "business_blue"
-                state["ppt_style_confirmed"] = True
-                state["confirmed"] = True
-                state["need_confirm"] = False
-                state["messages"].append("[confirm_node] 非交互环境，自动选择business_blue风格")
-                return state
+    # ========================================
+    # Step 1: 处理各类确认场景
+    # ========================================
     
-    # Step 2: 处理PPT满意度确认
-    # 检查是否已生成PPT且需要满意度确认
-    if (confirm_type == "ppt_satisfaction" and current_scene == "ppt_generate_node") or \
-       (current_scene == "ppt_generate_node" and state.get("ppt_url") and not state.get("ppt_satisfaction_confirmed")):
-        # PPT满意度确认模式
-        ppt_url = state.get("ppt_url", "")
-        ppt_title = state.get("ppt_structure", {}).get("title", "未命名PPT")
-        revision_count = state.get("ppt_revision_count", 0)
-        
-        from nodes.PPTGenerateNode import format_ppt_satisfaction_check
-        print("\n" + format_ppt_satisfaction_check(ppt_url, ppt_title, revision_count))
-        
-        while True:
-            try:
-                choice = input("\n请输入选项 (1/2/3): ").strip()
-                
-                if choice == "1":
-                    # 满意，完成任务
-                    state["ppt_satisfaction_confirmed"] = True
-                    state["confirmed"] = True
-                    state["cancelled"] = False
-                    state["need_confirm"] = False
-                    state["messages"].append("[confirm_node] 用户确认PPT满意，任务完成")
-                    print("[已确认] 任务完成！")
-                    return state
-                    
-                elif choice == "2":
-                    # 需要修改，在原有基础上调整
-                    state["ppt_satisfaction_confirmed"] = False
-                    state["confirmed"] = False
-                    state["cancelled"] = False
-                    state["need_confirm"] = False
-                    
-                    print("\n[修改意见] 请描述您希望如何修改PPT：")
-                    print("  例如：增加数据图表、调整某页内容、修改配色等")
-                    
-                    try:
-                        feedback = input("\n您的修改意见: ").strip()
-                        if feedback:
-                            state["ppt_satisfaction_feedback"] = feedback
-                            state["messages"].append(f"[confirm_node] 用户要求修改PPT: {feedback}")
-                        else:
-                            state["ppt_satisfaction_feedback"] = "用户未提供具体修改意见，请尝试优化内容"
-                            state["messages"].append("[confirm_node] 用户要求修改PPT，但未提供具体意见")
-                    except (EOFError, KeyboardInterrupt):
-                        state["ppt_satisfaction_feedback"] = "用户未提供具体修改意见，请尝试优化内容"
-                        state["messages"].append("[confirm_node] 用户要求修改PPT(非交互环境)")
-                    
-                    # 设置修改类型为"revise"（在原有基础上修改）
-                    state["ppt_revision_type"] = "revise"
-                    print("[修改中] 正在根据您的意见修改PPT...")
-                    return state
-                    
-                elif choice == "3":
-                    # 重新生成，保留大纲
-                    state["ppt_satisfaction_confirmed"] = False
-                    state["confirmed"] = False
-                    state["cancelled"] = False
-                    state["need_confirm"] = False
-                    
-                    print("\n[重新生成] 请描述您希望如何重新生成：")
-                    print("  例如：内容要更详细、风格要更活泼、增加案例分析等")
-                    
-                    try:
-                        feedback = input("\n您的意见: ").strip()
-                        if feedback:
-                            state["ppt_satisfaction_feedback"] = feedback
-                            state["messages"].append(f"[confirm_node] 用户要求重新生成PPT: {feedback}")
-                        else:
-                            state["ppt_satisfaction_feedback"] = "用户要求重新生成PPT，请尝试不同的内容"
-                            state["messages"].append("[confirm_node] 用户要求重新生成PPT")
-                    except (EOFError, KeyboardInterrupt):
-                        state["ppt_satisfaction_feedback"] = "用户要求重新生成PPT"
-                        state["messages"].append("[confirm_node] 用户要求重新生成PPT(非交互环境)")
-                    
-                    # 设置修改类型为"regenerate"（重新生成内容）
-                    state["ppt_revision_type"] = "regenerate"
-                    # 清除内容但保留大纲
-                    state["ppt_content"] = None
-                    print("[重新生成] 正在重新生成PPT内容...")
-                    return state
-                    
-                else:
-                    print("[警告] 无效输入，请输入 1、2 或 3")
-                    
-            except (EOFError, KeyboardInterrupt):
-                # 非交互环境，自动确认满意
-                print("\n[警告] 检测到非交互环境，自动确认满意")
-                state["ppt_satisfaction_confirmed"] = True
-                state["confirmed"] = True
-                state["need_confirm"] = False
-                state["messages"].append("[confirm_node] 非交互环境，自动确认PPT满意")
-                return state
+    # PPT内容确认（最高优先级，内容已生成完毕）
+    if confirm_type == "ppt_content" and ppt_content:
+        print("\n" + format_ppt_content(ppt_content))
+        item_name = "PPT内容"
     
-    # Step 3: 处理大纲/计划确认
-    # 根据当前场景决定确认什么内容
-    # PPT大纲确认：有ppt_structure且风格已确认但大纲未确认
-    if ppt_structure and current_scene == "ppt_generate_node" and state.get("ppt_style_confirmed") and not state.get("ppt_url"):
-        # PPT大纲确认模式
-        print("\n" + format_ppt_outline(ppt_structure))
-        confirm_type = "ppt_outline"
+    # PPT大纲确认
+    elif confirm_type == "ppt_outline" and ppt_outline:
+        print("\n" + format_ppt_outline(ppt_outline))
         item_name = "PPT大纲"
-    elif doc_outline and not state.get("confirmed") and current_scene == "text_generate_node":
-        # 文档大纲确认模式
+    
+    # 文档大纲确认
+    elif confirm_type == "doc_outline" and doc_outline and current_scene == "text_generate_node":
         print("\n" + format_doc_outline(doc_outline))
-        confirm_type = "outline"
         item_name = "文档大纲"
+    
+    # 任务计划确认
     elif task_plan and current_scene == "plan_node":
-        # 任务计划确认模式
         print("\n" + format_task_plan(task_plan))
-        confirm_type = "plan"
+        confirm_type = "task_plan"
         item_name = "任务计划"
+    
     else:
         logger.warning("[confirm_node] 没有可确认的内容")
         state["error"] = "没有可确认的内容"
         return state
+    
+    # 设置确认类型到state，供后续路由使用
+    state["confirm_type"] = confirm_type
     
     # 命令行交互
     while True:
@@ -299,45 +207,53 @@ async def confirm_node(state: IMState) -> IMState:
                 
                 # 收集用户修改意见
                 print(f"\n[修改意见] 请描述您希望如何调整{item_name}:")
-                if confirm_type == "outline":
+                if confirm_type == "doc_outline":
                     print("  例如：增加XXX章节、删除XXX部分、调整顺序等")
+                elif confirm_type == "ppt_outline":
+                    print("  例如：增加封面页、删除某页内容、调整页面顺序等")
+                elif confirm_type == "ppt_content":
+                    print("  例如：修改某页标题、调整要点表述、增加数据等")
                 else:
                     print("  例如：不需要生成PPT、文档要更详细、先确认大纲再生成 等")
                 
                 try:
                     feedback = input("\n您的意见: ").strip()
                     if feedback:
-                        if confirm_type == "outline":
+                        # 根据确认类型存储反馈到对应字段
+                        if confirm_type == "doc_outline":
                             state["outline_feedback"] = feedback
                         elif confirm_type == "ppt_outline":
                             state["ppt_outline_feedback"] = feedback
+                        elif confirm_type == "ppt_content":
+                            state["ppt_content_feedback"] = feedback
                         else:
                             state["plan_feedback"] = feedback
                         state["messages"].append(f"[confirm_node] 用户要求修改: {feedback}")
                     else:
                         feedback_msg = "用户未提供具体意见，请尝试生成不同的方案"
-                        if confirm_type == "outline":
+                        if confirm_type == "doc_outline":
                             state["outline_feedback"] = feedback_msg
                         elif confirm_type == "ppt_outline":
                             state["ppt_outline_feedback"] = feedback_msg
+                        elif confirm_type == "ppt_content":
+                            state["ppt_content_feedback"] = feedback_msg
                         else:
                             state["plan_feedback"] = feedback_msg
                         state["messages"].append(f"[confirm_node] 用户要求修改，但未提供具体意见")
                 except (EOFError, KeyboardInterrupt):
                     feedback_msg = "用户未提供具体意见，请尝试生成不同的方案"
-                    if confirm_type == "outline":
+                    if confirm_type == "doc_outline":
                         state["outline_feedback"] = feedback_msg
                     elif confirm_type == "ppt_outline":
                         state["ppt_outline_feedback"] = feedback_msg
+                    elif confirm_type == "ppt_content":
+                        state["ppt_content_feedback"] = feedback_msg
                     else:
                         state["plan_feedback"] = feedback_msg
                     state["messages"].append(f"[confirm_node] 用户要求修改(非交互环境)")
                 
                 # 保存之前的内容供参考
-                if confirm_type == "outline":
-                    # 大纲修改时保留当前大纲作为参考
-                    pass
-                else:
+                if confirm_type == "task_plan":
                     state["previous_plan"] = task_plan
                 
                 print(f"[重新生成] 正在根据您的意见重新生成{item_name}...")
@@ -400,11 +316,6 @@ if __name__ == "__main__":
         },
         need_confirm=True
     )
-    
-    # result1 = asyncio.run(confirm_node(test_state1))
-    # print("\n最终状态:")
-    # print(f"  confirmed: {result1.get('confirmed')}")
-    # print(f"  cancelled: {result1.get('cancelled')}")
     
     # 测试用例2 - 文档大纲确认
     print("\n" + "=" * 50)

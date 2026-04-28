@@ -1,25 +1,39 @@
+"""PPT生成节点
+
+整合PPT生成Agent技能配置，实现完整的PPT生成流程：
+1. 大纲生成 → 2. 用户确认 → 3. 内容生成 → 4. PPT文件制作
+
+该模块与 nodes/agent/skills/pptx 技能模块深度整合，利用PptxGenJS技术栈生成高质量PPT文件。
+"""
 import asyncio
 import json
-import re
 import os
+import re
+import subprocess
+import tempfile
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional, Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
-from pptx import Presentation
-from pptx.util import Inches, Pt
-from pptx.enum.text import PP_ALIGN
-from pptx.dml.color import RGBColor
-from pptx.enum.shapes import MSO_SHAPE
-from pptx.chart.data import ChartData
-from pptx.enum.chart import XL_CHART_TYPE
-
+from langchain_core.messages import HumanMessage
 from state.state import IMState
 from utils.logger_handler import logger
-from nodes.agent.ppt_agent import ppt_outline_agent, ppt_outline_revision_agent, ppt_content_agent
-from nodes.agent.prompt.ppt_prompt import ppt_outline_prompt, ppt_content_prompt, ppt_outline_revision_prompt
-from utils.feishuUtils import feishu_api
+from nodes.agent.ppt_generate_agent import (
+    ppt_outline_agent,
+    ppt_outline_revision_agent,
+    ppt_content_agent,
+    ppt_content_revision_agent
+)
+from nodes.agent.prompt.ppt_generate_prompt import (
+    ppt_outline_prompt,
+    ppt_outline_revision_prompt,
+    ppt_content_prompt,
+    ppt_content_revision_prompt
+)
 
+
+# ============================================
+# 工具函数
+# ============================================
 
 def extract_json(content: str) -> str:
     """从 LLM 返回内容中提取 JSON"""
@@ -29,1236 +43,1299 @@ def extract_json(content: str) -> str:
     return content.strip()
 
 
-def get_ppt_style_from_intent(intent: Dict) -> str:
-    """根据用户意图和主题推断PPT风格"""
-    topic = intent.get("topic", "").lower()
+def escape_js_string(text: str) -> str:
+    """转义JavaScript字符串中的特殊字符
     
-    tech_keywords = ["技术", "tech", "代码", "code", "算法", "ai", "人工智能", "开发", "架构", "系统"]
-    creative_keywords = ["创意", "营销", "活动", "推广", "品牌", "广告", "设计"]
-    edu_keywords = ["教育", "培训", "学习", "课程", "环保", "健康", "医疗"]
-    luxury_keywords = ["高端", "时尚", "艺术", "设计", "品牌", "精品", "奢侈"]
-    academic_keywords = ["学术", "论文", "研究", "报告", "分析", "极简", "简约"]
-    
-    if any(kw in topic for kw in tech_keywords):
-        return "tech_dark"
-    elif any(kw in topic for kw in creative_keywords):
-        return "warm_orange"
-    elif any(kw in topic for kw in edu_keywords):
-        return "fresh_green"
-    elif any(kw in topic for kw in luxury_keywords):
-        return "elegant_purple"
-    elif any(kw in topic for kw in academic_keywords):
-        return "minimal_white"
-    else:
-        return "business_blue"
+    处理:
+    - 换行符 -> \\n
+    - 双引号 -> \\"
+    - 反斜杠 -> \\\\
+    - 其他特殊字符
+    """
+    if not text:
+        return ""
+    # 先处理反斜杠，再处理其他字符
+    text = text.replace('\\', '\\\\')
+    text = text.replace('"', '\\"')
+    text = text.replace("\n", ' ')
+    text = text.replace("\r", ' ')
+    text = text.replace("\t", ' ')
+    # 移除其他控制字符
+    text = ''.join(char for char in text if ord(char) >= 32 or char in '\n\r\t')
+    return text
 
 
-def build_ppt_outline_messages(state: IMState) -> list:
+def format_ppt_outline(ppt_outline: dict) -> str:
+    """格式化PPT大纲为易读的文本"""
+    lines = []
+    lines.append("=" * 60)
+    lines.append(f"[PPT标题] {ppt_outline.get('title', 'N/A')}")
+    lines.append(f"[PPT类型] {ppt_outline.get('ppt_type', 'N/A')}")
+    lines.append(f"[总页数] {ppt_outline.get('total_pages', 'N/A')}")
+    lines.append("=" * 60)
+    
+    lines.append("\n[页面结构]")
+    slides = ppt_outline.get('slides', [])
+    for slide in slides:
+        page_num = slide.get('page_number', '?')
+        slide_type = slide.get('type', 'content')
+        title = slide.get('title', '未命名页面')
+        layout = slide.get('layout', '-')
+        
+        type_emoji = {
+            'cover': '📔',
+            'table_of_contents': '📋',
+            'content': '📝',
+            'section_divider': '🔖',
+            'final': '🎉'
+        }.get(slide_type, '📄')
+        
+        lines.append(f"  {type_emoji} 第{page_num}页 [{slide_type}] {title}")
+        
+        content = slide.get('content', [])
+        if content and slide_type == 'content':
+            for point in content:
+                lines.append(f"     • {point}")
+        
+        visual_note = slide.get('visual_note', '')
+        if visual_note:
+            lines.append(f"     💡 视觉建议: {visual_note}")
+        
+        lines.append("")
+    
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
+def format_ppt_content(ppt_content: dict) -> str:
+    """格式化PPT内容为易读的文本摘要"""
+    lines = []
+    lines.append("=" * 60)
+    lines.append(f"[PPT标题] {ppt_content.get('title', 'N/A')}")
+    lines.append(f"[总页数] {ppt_content.get('total_pages', 'N/A')}")
+    lines.append("=" * 60)
+    
+    slides = ppt_content.get('slides', [])
+    for slide in slides:
+        page_num = slide.get('page_number', '?')
+        title = slide.get('title', '未命名页面')
+        slide_type = slide.get('type', 'content')
+        
+        type_emoji = {
+            'cover': '📔',
+            'table_of_contents': '📋',
+            'content': '📝',
+            'section_divider': '🔖',
+            'final': '🎉'
+        }.get(slide_type, '📄')
+        
+        lines.append(f"\n{type_emoji} 第{page_num}页: {title}")
+        
+        bullets = slide.get('bullets', [])
+        if bullets:
+            for bullet in bullets:
+                lines.append(f"   • {bullet}")
+        
+        subtitle = slide.get('subtitle', '')
+        if subtitle:
+            lines.append(f"   副标题: {subtitle}")
+    
+    lines.append("\n" + "=" * 60)
+    return "\n".join(lines)
+
+
+# ============================================
+# 消息构建函数
+# ============================================
+
+def build_outline_messages(state: IMState) -> list:
     """构建PPT大纲生成的消息列表"""
     intent = state.get("intent", {})
     chat_context = state.get("chat_context", "")
     
     topic = intent.get("topic", "未命名PPT")
-    ppt_type = intent.get("additional_info", {}).get("ppt_type", "meeting_presentation")
+    ppt_type = intent.get("additional_info", {}).get("ppt_type", "presentation")
     key_points = intent.get("key_points", [])
-    ppt_style = get_ppt_style_from_intent(intent)
+    target_pages = intent.get("additional_info", {}).get("target_pages", 10)
     
     current_date = datetime.now().strftime("%Y.%m.%d")
-    key_points_str = "\n".join([f"- {point}" for point in key_points]) if key_points else "无特定要点"
     
-    user_message = f"""请根据以下信息生成PPT大纲：
-
-**PPT主题**: {topic}
-**PPT类型**: {ppt_type}
-**PPT风格**: {ppt_style}
-**关键要点**:
-{key_points_str}
-**上下文信息**: {chat_context if chat_context else "无"}
-**当前日期**: {current_date}
-
-请生成结构清晰的PPT大纲。"""
-
-    return [
-        SystemMessage(content=ppt_outline_prompt),
-        HumanMessage(content=user_message)
-    ]
-
-
-def build_ppt_outline_revision_messages(state: IMState) -> list:
-    """构建PPT大纲修改的消息列表"""
-    intent = state.get("intent", {})
-    chat_context = state.get("chat_context", "")
-    ppt_structure = state.get("ppt_structure", {})
-    ppt_outline_feedback = state.get("ppt_outline_feedback", "")
+    # 检查是否有用户反馈（大纲修改的情况）
+    outline_feedback = state.get("ppt_outline_feedback")
+    current_outline = state.get("ppt_outline")
     
-    topic = intent.get("topic", "未命名PPT")
-    ppt_type = ppt_structure.get("ppt_type", "meeting_presentation")
-    ppt_style = ppt_structure.get("ppt_style", "business_blue")
-    key_points = intent.get("key_points", [])
+    if outline_feedback and current_outline:
+        # 用户要求修改大纲
+        prompt = ppt_outline_revision_prompt.format(
+            topic=topic,
+            ppt_type=ppt_type,
+            key_points=json.dumps(key_points, ensure_ascii=False),
+            context=chat_context,
+            current_outline=json.dumps(current_outline, ensure_ascii=False, indent=2),
+            user_feedback=outline_feedback,
+            current_date=current_date,
+            target_pages=target_pages
+        )
+        logger.info(f"[ppt_generate_node] 重新生成PPT大纲，用户反馈: {outline_feedback}")
+    else:
+        # 首次生成大纲
+        prompt = ppt_outline_prompt.format(
+            topic=topic,
+            ppt_type=ppt_type,
+            key_points=json.dumps(key_points, ensure_ascii=False),
+            context=chat_context,
+            current_date=current_date,
+            target_pages=target_pages
+        )
     
-    current_date = datetime.now().strftime("%Y.%m.%d")
-    key_points_str = "\n".join([f"- {point}" for point in key_points]) if key_points else "无特定要点"
-    current_outline_str = json.dumps(ppt_structure, ensure_ascii=False, indent=2)
-    
-    user_message = f"""请根据用户反馈修改PPT大纲：
-
-**PPT主题**: {topic}
-**PPT类型**: {ppt_type}
-**PPT风格**: {ppt_style}
-**当前大纲**:
-{current_outline_str}
-
-**用户反馈**: {ppt_outline_feedback}
-
-**关键要点**:
-{key_points_str}
-**上下文信息**: {chat_context if chat_context else "无"}
-**当前日期**: {current_date}
-
-请根据用户反馈修改PPT大纲。"""
-
-    return [
-        SystemMessage(content=ppt_outline_revision_prompt),
-        HumanMessage(content=user_message)
-    ]
+    messages = [HumanMessage(content=prompt)]
+    return messages
 
 
-def build_ppt_content_messages(ppt_structure: Dict, slide: Dict, chat_context: str) -> list:
+def build_content_messages(state: IMState) -> list:
     """构建PPT内容生成的消息列表"""
-    title = ppt_structure.get("title", "")
-    ppt_type = ppt_structure.get("ppt_type", "meeting_presentation")
-    ppt_style = ppt_structure.get("ppt_style", "business_blue")
-    
-    page = slide.get("page", 1)
-    slide_type = slide.get("type", "content")
-    slide_title = slide.get("title", "")
-    original_points = slide.get("points", [])
-    
-    points_str = "\n".join([f"- {point}" for point in original_points]) if original_points else "无"
-    
-    user_message = f"""请为以下PPT页面生成丰富内容：
-
-**PPT主题**: {title}
-**PPT类型**: {ppt_type}
-**PPT风格**: {ppt_style}
-**当前页面**: 第{page}页
-**页面类型**: {slide_type}
-**页面标题**: {slide_title}
-**原始要点**:
-{points_str}
-**上下文信息**: {chat_context if chat_context else "无"}
-
-请生成丰富、有数据支撑、适合视觉呈现的PPT内容。"""
-
-    return [
-        SystemMessage(content=ppt_content_prompt),
-        HumanMessage(content=user_message)
-    ]
-
-
-def format_ppt_outline(ppt_structure: Dict) -> str:
-    """格式化PPT大纲为易读的文本"""
-    lines = []
-    lines.append("=" * 50)
-    lines.append(f"[PPT标题] {ppt_structure.get('title', 'N/A')}")
-    lines.append(f"[PPT类型] {ppt_structure.get('ppt_type', 'N/A')}")
-    lines.append(f"[PPT风格] {ppt_structure.get('ppt_style', 'business_blue')}")
-    lines.append("=" * 50)
-    
-    lines.append("\n[PPT结构]")
-    slides = ppt_structure.get('slides', [])
-    for slide in slides:
-        page = slide.get('page', 0)
-        slide_type = slide.get('type', 'content')
-        title = slide.get('title', '未命名页面')
-        
-        type_emoji = {
-            'cover': '📘',
-            'agenda': '📋',
-            'content': '📝',
-            'summary': '✅',
-            'ending': '🎉'
-        }.get(slide_type, '📄')
-        
-        lines.append(f"  {type_emoji} 第{page}页 [{slide_type}] {title}")
-        
-        if slide_type in ['agenda', 'content', 'summary']:
-            points = slide.get('points', [])
-            for point in points:
-                lines.append(f"     • {point}")
-        
-        if slide.get('subtitle'):
-            lines.append(f"     副标题: {slide['subtitle']}")
-    
-    lines.append("\n" + "=" * 50)
-    lines.append("请确认此大纲是否满意？")
-    lines.append("- 输入 '确认' 或 'ok' 开始生成PPT")
-    lines.append("- 输入修改意见，如'增加一页关于xxx的内容'")
-    lines.append("- 输入 '取消' 终止PPT生成")
-    lines.append("=" * 50)
-    
-    return "\n".join(lines)
-
-
-# 模板风格配色方案
-PPT_STYLES = {
-    "business_blue": {
-        "name": "商务蓝",
-        "primary": RGBColor(41, 98, 255),
-        "secondary": RGBColor(0, 150, 199),
-        "accent": RGBColor(255, 107, 107),
-        "dark": RGBColor(33, 37, 41),
-        "light": RGBColor(248, 249, 250),
-        "white": RGBColor(255, 255, 255),
-        "background": RGBColor(41, 98, 255),
-    },
-    "tech_dark": {
-        "name": "科技黑",
-        "primary": RGBColor(0, 255, 136),
-        "secondary": RGBColor(0, 184, 255),
-        "accent": RGBColor(255, 50, 100),
-        "dark": RGBColor(18, 18, 18),
-        "light": RGBColor(30, 30, 30),
-        "white": RGBColor(255, 255, 255),
-        "background": RGBColor(18, 18, 18),
-    },
-    "fresh_green": {
-        "name": "清新绿",
-        "primary": RGBColor(46, 204, 113),
-        "secondary": RGBColor(39, 174, 96),
-        "accent": RGBColor(241, 196, 15),
-        "dark": RGBColor(44, 62, 80),
-        "light": RGBColor(236, 240, 241),
-        "white": RGBColor(255, 255, 255),
-        "background": RGBColor(46, 204, 113),
-    },
-    "warm_orange": {
-        "name": "活力橙",
-        "primary": RGBColor(255, 140, 0),
-        "secondary": RGBColor(255, 87, 34),
-        "accent": RGBColor(255, 193, 7),
-        "dark": RGBColor(62, 39, 35),
-        "light": RGBColor(255, 243, 224),
-        "white": RGBColor(255, 255, 255),
-        "background": RGBColor(255, 140, 0),
-    },
-    "minimal_white": {
-        "name": "极简白",
-        "primary": RGBColor(52, 73, 94),
-        "secondary": RGBColor(149, 165, 166),
-        "accent": RGBColor(231, 76, 60),
-        "dark": RGBColor(44, 62, 80),
-        "light": RGBColor(250, 250, 250),
-        "white": RGBColor(255, 255, 255),
-        "background": RGBColor(52, 73, 94),
-    },
-    "elegant_purple": {
-        "name": "优雅紫",
-        "primary": RGBColor(155, 89, 182),
-        "secondary": RGBColor(142, 68, 173),
-        "accent": RGBColor(236, 112, 99),
-        "dark": RGBColor(44, 62, 80),
-        "light": RGBColor(245, 238, 250),
-        "white": RGBColor(255, 255, 255),
-        "background": RGBColor(155, 89, 182),
-    },
-}
-
-
-def add_number_card(slide, x, y, width, height, number, label, color, bg_color):
-    """添加数字卡片"""
-    # 卡片背景
-    card = slide.shapes.add_shape(
-        MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(width), Inches(height)
-    )
-    card.fill.solid()
-    card.fill.fore_color.rgb = bg_color
-    card.line.fill.background()
-    
-    # 数字
-    num_box = slide.shapes.add_textbox(Inches(x), Inches(y + 0.2), Inches(width), Inches(height * 0.5))
-    num_frame = num_box.text_frame
-    num_frame.text = str(number)
-    num_para = num_frame.paragraphs[0]
-    num_para.font.size = Pt(36)
-    num_para.font.bold = True
-    num_para.font.color.rgb = color
-    num_para.alignment = PP_ALIGN.CENTER
-    
-    # 标签
-    label_box = slide.shapes.add_textbox(Inches(x), Inches(y + height * 0.5), Inches(width), Inches(height * 0.4))
-    label_frame = label_box.text_frame
-    label_frame.text = label
-    label_para = label_frame.paragraphs[0]
-    label_para.font.size = Pt(14)
-    label_para.font.color.rgb = RGBColor(108, 117, 125)
-    label_para.alignment = PP_ALIGN.CENTER
-
-
-def add_chart(slide, x, y, width, height, chart_type, data, colors):
-    """添加图表"""
-    try:
-        chart_data = ChartData()
-        chart_data.categories = data.get('labels', [])
-        chart_data.add_series('数据', data.get('values', []))
-        
-        if chart_type == 'bar':
-            chart = slide.shapes.add_chart(
-                XL_CHART_TYPE.COLUMN_CLUSTERED, Inches(x), Inches(y), 
-                Inches(width), Inches(height), chart_data
-            ).chart
-        elif chart_type == 'pie':
-            chart = slide.shapes.add_chart(
-                XL_CHART_TYPE.PIE, Inches(x), Inches(y), 
-                Inches(width), Inches(height), chart_data
-            ).chart
-        elif chart_type == 'line':
-            chart = slide.shapes.add_chart(
-                XL_CHART_TYPE.LINE, Inches(x), Inches(y), 
-                Inches(width), Inches(height), chart_data
-            ).chart
-        
-        return chart
-    except Exception as e:
-        logger.warning(f"添加图表失败: {e}")
-        return None
-
-
-def create_ppt_file(ppt_structure: Dict, ppt_content: Dict, output_path: str) -> str:
-    """使用python-pptx创建美观的PPT文件"""
-    prs = Presentation()
-    prs.slide_width = Inches(13.333)
-    prs.slide_height = Inches(7.5)
-    
-    style_name = ppt_structure.get("ppt_style", "business_blue")
-    COLORS = PPT_STYLES.get(style_name, PPT_STYLES["business_blue"])
-    
-    slides_data = ppt_content.get("slides", [])
-    
-    for idx, slide_data in enumerate(slides_data):
-        slide_type = slide_data.get("type", "content")
-        title = slide_data.get("title", "")
-        subtitle = slide_data.get("subtitle", "")
-        content = slide_data.get("content", {})
-        visual_suggestions = content.get("visual_suggestions", {})
-        main_points = content.get("main_points", [])
-        
-        slide_layout = prs.slide_layouts[6]
-        slide = prs.slides.add_slide(slide_layout)
-        
-        if slide_type == "cover":
-            # 封面页 - 渐变背景效果
-            bg_shape = slide.shapes.add_shape(
-                MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(7.5)
-            )
-            bg_shape.fill.solid()
-            bg_shape.fill.fore_color.rgb = COLORS['background']
-            bg_shape.line.fill.background()
-            
-            # 装饰性圆形
-            circle1 = slide.shapes.add_shape(
-                MSO_SHAPE.OVAL, Inches(9), Inches(-2), Inches(6), Inches(6)
-            )
-            circle1.fill.solid()
-            circle1.fill.fore_color.rgb = COLORS['white']
-            circle1.line.fill.background()
-            
-            circle2 = slide.shapes.add_shape(
-                MSO_SHAPE.OVAL, Inches(-2), Inches(5), Inches(4), Inches(4)
-            )
-            circle2.fill.solid()
-            circle2.fill.fore_color.rgb = COLORS['secondary']
-            circle2.line.fill.background()
-            
-            # 主标题
-            title_box = slide.shapes.add_textbox(Inches(0.8), Inches(2.0), Inches(11.733), Inches(1.5))
-            title_frame = title_box.text_frame
-            title_frame.word_wrap = True
-            title_frame.text = title
-            title_para = title_frame.paragraphs[0]
-            title_para.font.size = Pt(54)
-            title_para.font.bold = True
-            title_para.font.color.rgb = COLORS['white']
-            title_para.alignment = PP_ALIGN.CENTER
-            
-            # 副标题
-            if subtitle:
-                subtitle_box = slide.shapes.add_textbox(Inches(0.8), Inches(3.8), Inches(11.733), Inches(1))
-                subtitle_frame = subtitle_box.text_frame
-                subtitle_frame.text = subtitle
-                subtitle_para = subtitle_frame.paragraphs[0]
-                subtitle_para.font.size = Pt(28)
-                subtitle_para.font.color.rgb = COLORS['white']
-                subtitle_para.alignment = PP_ALIGN.CENTER
-            
-            # 演讲者信息
-            speaker_info = content.get("speaker_info", "")
-            if speaker_info:
-                info_box = slide.shapes.add_textbox(Inches(0.8), Inches(5.5), Inches(11.733), Inches(0.8))
-                info_frame = info_box.text_frame
-                info_frame.text = speaker_info
-                info_para = info_frame.paragraphs[0]
-                info_para.font.size = Pt(18)
-                info_para.font.color.rgb = COLORS['white']
-                info_para.alignment = PP_ALIGN.CENTER
-                
-        elif slide_type == "agenda":
-            # 目录页 - 左侧色块设计
-            left_bar = slide.shapes.add_shape(
-                MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(0.2), Inches(7.5)
-            )
-            left_bar.fill.solid()
-            left_bar.fill.fore_color.rgb = COLORS['primary']
-            left_bar.line.fill.background()
-            
-            # 标题
-            title_box = slide.shapes.add_textbox(Inches(0.8), Inches(0.5), Inches(12), Inches(1))
-            title_frame = title_box.text_frame
-            title_frame.text = title
-            title_para = title_frame.paragraphs[0]
-            title_para.font.size = Pt(42)
-            title_para.font.bold = True
-            title_para.font.color.rgb = COLORS['dark']
-            
-            # 副标题
-            if subtitle:
-                sub_box = slide.shapes.add_textbox(Inches(0.8), Inches(1.3), Inches(12), Inches(0.6))
-                sub_frame = sub_box.text_frame
-                sub_frame.text = subtitle
-                sub_para = sub_frame.paragraphs[0]
-                sub_para.font.size = Pt(18)
-                sub_para.font.color.rgb = COLORS['gray'] if 'gray' in COLORS else RGBColor(108, 117, 125)
-            
-            # 目录项 - 双列布局
-            points = content.get("points", [])
-            if points:
-                items_per_col = (len(points) + 1) // 2
-                for i, point in enumerate(points[:8]):  # 最多8个
-                    col = i // items_per_col
-                    row = i % items_per_col
-                    x = 0.8 + col * 6
-                    y = 2.2 + row * 1.0
-                    
-                    # 序号
-                    num_box = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(0.5), Inches(0.6))
-                    num_frame = num_box.text_frame
-                    num_frame.text = f"{i+1:02d}"
-                    num_para = num_frame.paragraphs[0]
-                    num_para.font.size = Pt(24)
-                    num_para.font.bold = True
-                    num_para.font.color.rgb = COLORS['primary']
-                    
-                    # 内容
-                    content_box = slide.shapes.add_textbox(Inches(x + 0.6), Inches(y), Inches(5), Inches(0.8))
-                    content_frame = content_box.text_frame
-                    content_frame.word_wrap = True
-                    content_frame.text = point
-                    content_para = content_frame.paragraphs[0]
-                    content_para.font.size = Pt(20)
-                    content_para.font.color.rgb = COLORS['dark']
-                    
-        elif slide_type == "content":
-            # 内容页 - 多种布局支持
-            layout_type = visual_suggestions.get("layout", "standard")
-            
-            # 顶部装饰条
-            top_bar = slide.shapes.add_shape(
-                MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(0.15)
-            )
-            top_bar.fill.solid()
-            top_bar.fill.fore_color.rgb = COLORS['primary']
-            top_bar.line.fill.background()
-            
-            # 标题区域
-            title_box = slide.shapes.add_textbox(Inches(0.6), Inches(0.4), Inches(12), Inches(0.9))
-            title_frame = title_box.text_frame
-            title_frame.text = title
-            title_para = title_frame.paragraphs[0]
-            title_para.font.size = Pt(36)
-            title_para.font.bold = True
-            title_para.font.color.rgb = COLORS['dark']
-            
-            # 副标题
-            if subtitle:
-                sub_box = slide.shapes.add_textbox(Inches(0.6), Inches(1.1), Inches(12), Inches(0.5))
-                sub_frame = sub_box.text_frame
-                sub_frame.text = subtitle
-                sub_para = sub_frame.paragraphs[0]
-                sub_para.font.size = Pt(16)
-                sub_para.font.color.rgb = COLORS['gray'] if 'gray' in COLORS else RGBColor(108, 117, 125)
-            
-            # 根据布局类型渲染内容
-            if layout_type == "three_columns" and len(main_points) >= 3:
-                # 三栏布局
-                col_width = 4
-                for i, point in enumerate(main_points[:3]):
-                    x = 0.6 + i * (col_width + 0.3)
-                    
-                    # 图标区域
-                    icon_text = point.get("title", "")[:2]
-                    icon_box = slide.shapes.add_shape(
-                        MSO_SHAPE.OVAL, Inches(x + 1.3), Inches(1.8), Inches(1), Inches(1)
-                    )
-                    icon_box.fill.solid()
-                    icon_box.fill.fore_color.rgb = COLORS['primary'] if i == 0 else (COLORS['secondary'] if i == 1 else COLORS['accent'])
-                    icon_box.line.fill.background()
-                    
-                    # 标题
-                    point_title = point.get("title", "")
-                    title_box = slide.shapes.add_textbox(Inches(x), Inches(3.0), Inches(col_width), Inches(0.8))
-                    title_frame = title_box.text_frame
-                    title_frame.word_wrap = True
-                    title_frame.text = point_title
-                    title_para = title_frame.paragraphs[0]
-                    title_para.font.size = Pt(18)
-                    title_para.font.bold = True
-                    title_para.font.color.rgb = COLORS['dark']
-                    title_para.alignment = PP_ALIGN.CENTER
-                    
-                    # 详细说明
-                    detail = point.get("detail", "")
-                    detail_box = slide.shapes.add_textbox(Inches(x + 0.2), Inches(3.8), Inches(col_width - 0.4), Inches(2.5))
-                    detail_frame = detail_box.text_frame
-                    detail_frame.word_wrap = True
-                    detail_frame.text = detail
-                    detail_para = detail_frame.paragraphs[0]
-                    detail_para.font.size = Pt(13)
-                    detail_para.font.color.rgb = COLORS['dark']
-                    detail_para.line_spacing = 1.3
-                    
-            elif layout_type == "left_text_right_chart":
-                # 左文右图布局
-                # 左侧要点
-                for i, point in enumerate(main_points[:3]):
-                    y = 1.8 + i * 1.5
-                    
-                    # 要点标记
-                    bullet = slide.shapes.add_shape(
-                        MSO_SHAPE.OVAL, Inches(0.7), Inches(y + 0.1), Inches(0.2), Inches(0.2)
-                    )
-                    bullet.fill.solid()
-                    bullet.fill.fore_color.rgb = COLORS['primary']
-                    bullet.line.fill.background()
-                    
-                    # 标题
-                    title_box = slide.shapes.add_textbox(Inches(1.1), Inches(y), Inches(5.5), Inches(0.5))
-                    title_frame = title_box.text_frame
-                    title_frame.text = point.get("title", "")
-                    title_para = title_frame.paragraphs[0]
-                    title_para.font.size = Pt(16)
-                    title_para.font.bold = True
-                    title_para.font.color.rgb = COLORS['dark']
-                    
-                    # 详细说明
-                    detail_box = slide.shapes.add_textbox(Inches(1.1), Inches(y + 0.5), Inches(5.5), Inches(0.9))
-                    detail_frame = detail_box.text_frame
-                    detail_frame.word_wrap = True
-                    detail_frame.text = point.get("detail", "")
-                    detail_para = detail_frame.paragraphs[0]
-                    detail_para.font.size = Pt(12)
-                    detail_para.font.color.rgb = COLORS['dark']
-                    detail_para.line_spacing = 1.2
-                
-                # 右侧图表区域
-                chart_data = visual_suggestions.get("chart_data", {})
-                if chart_data:
-                    add_chart(slide, 7, 1.8, 5.5, 4, 'bar', chart_data, COLORS)
-                else:
-                    # 数字卡片
-                    for i in range(min(2, len(main_points))):
-                        highlight = main_points[i].get("highlight", "")
-                        if highlight:
-                            add_number_card(slide, 7.5 + i * 2.8, 2.5, 2.5, 1.5, 
-                                          highlight, main_points[i].get("title", "")[:6], 
-                                          COLORS['primary'], COLORS['light'])
-                            
-            else:
-                # 标准布局 - 列表形式
-                for i, point in enumerate(main_points[:5]):
-                    y = 1.8 + i * 1.1
-                    
-                    # 序号圆圈
-                    num_circle = slide.shapes.add_shape(
-                        MSO_SHAPE.OVAL, Inches(0.6), Inches(y + 0.05), Inches(0.4), Inches(0.4)
-                    )
-                    num_circle.fill.solid()
-                    num_circle.fill.fore_color.rgb = COLORS['primary']
-                    num_circle.line.fill.background()
-                    
-                    # 序号文字
-                    num_text = slide.shapes.add_textbox(Inches(0.6), Inches(y + 0.05), Inches(0.4), Inches(0.4))
-                    num_text_frame = num_text.text_frame
-                    num_text_frame.text = str(i + 1)
-                    num_para = num_text_frame.paragraphs[0]
-                    num_para.font.size = Pt(14)
-                    num_para.font.bold = True
-                    num_para.font.color.rgb = COLORS['white']
-                    num_para.alignment = PP_ALIGN.CENTER
-                    
-                    # 标题
-                    title_box = slide.shapes.add_textbox(Inches(1.2), Inches(y), Inches(11.5), Inches(0.5))
-                    title_frame = title_box.text_frame
-                    title_frame.text = point.get("title", "")
-                    title_para = title_frame.paragraphs[0]
-                    title_para.font.size = Pt(18)
-                    title_para.font.bold = True
-                    title_para.font.color.rgb = COLORS['dark']
-                    
-                    # 详细说明
-                    detail_box = slide.shapes.add_textbox(Inches(1.2), Inches(y + 0.5), Inches(11.5), Inches(0.6))
-                    detail_frame = detail_box.text_frame
-                    detail_frame.word_wrap = True
-                    detail_frame.text = point.get("detail", "")
-                    detail_para = detail_frame.paragraphs[0]
-                    detail_para.font.size = Pt(13)
-                    detail_para.font.color.rgb = COLORS['dark']
-                    detail_para.line_spacing = 1.2
-                    
-        elif slide_type == "summary":
-            # 总结页 - 卡片式设计
-            bg = slide.shapes.add_shape(
-                MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(7.5)
-            )
-            bg.fill.solid()
-            bg.fill.fore_color.rgb = COLORS['light']
-            bg.line.fill.background()
-            
-            # 标题
-            title_box = slide.shapes.add_textbox(Inches(0.6), Inches(0.4), Inches(12), Inches(0.9))
-            title_frame = title_box.text_frame
-            title_frame.text = title
-            title_para = title_frame.paragraphs[0]
-            title_para.font.size = Pt(40)
-            title_para.font.bold = True
-            title_para.font.color.rgb = COLORS['dark']
-            
-            # 总结要点 - 2x2卡片布局
-            for i, point in enumerate(main_points[:4]):
-                col = i % 2
-                row = i // 2
-                x = 0.6 + col * 6.3
-                y = 1.5 + row * 2.8
-                
-                # 卡片背景
-                card = slide.shapes.add_shape(
-                    MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(6), Inches(2.5)
-                )
-                card.fill.solid()
-                card.fill.fore_color.rgb = COLORS['white']
-                card.line.color.rgb = RGBColor(222, 226, 230)
-                
-                # 左侧色条
-                bar = slide.shapes.add_shape(
-                    MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(0.1), Inches(2.5)
-                )
-                bar.fill.solid()
-                bar.fill.fore_color.rgb = COLORS['primary'] if i % 2 == 0 else COLORS['secondary']
-                bar.line.fill.background()
-                
-                # 勾选图标
-                check = slide.shapes.add_shape(
-                    MSO_SHAPE.OVAL, Inches(x + 0.3), Inches(y + 0.3), Inches(0.5), Inches(0.5)
-                )
-                check.fill.solid()
-                check.fill.fore_color.rgb = COLORS['primary'] if i % 2 == 0 else COLORS['secondary']
-                check.line.fill.background()
-                
-                # 标题
-                card_title = slide.shapes.add_textbox(Inches(x + 0.9), Inches(y + 0.2), Inches(4.8), Inches(0.6))
-                card_title_frame = card_title.text_frame
-                card_title_frame.text = point.get("title", "")
-                card_title_para = card_title_frame.paragraphs[0]
-                card_title_para.font.size = Pt(16)
-                card_title_para.font.bold = True
-                card_title_para.font.color.rgb = COLORS['dark']
-                
-                # 详细内容
-                card_detail = slide.shapes.add_textbox(Inches(x + 0.3), Inches(y + 0.9), Inches(5.4), Inches(1.4))
-                card_detail_frame = card_detail.text_frame
-                card_detail_frame.word_wrap = True
-                card_detail_frame.text = point.get("detail", "")
-                card_detail_para = card_detail_frame.paragraphs[0]
-                card_detail_para.font.size = Pt(12)
-                card_detail_para.font.color.rgb = COLORS['dark']
-                card_detail_para.line_spacing = 1.2
-                    
-        elif slide_type == "ending":
-            # 结束页
-            bg = slide.shapes.add_shape(
-                MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(7.5)
-            )
-            bg.fill.solid()
-            bg.fill.fore_color.rgb = COLORS['background']
-            bg.line.fill.background()
-            
-            # 装饰线条
-            line = slide.shapes.add_shape(
-                MSO_SHAPE.RECTANGLE, Inches(4), Inches(3.2), Inches(5.333), Inches(0.04)
-            )
-            line.fill.solid()
-            line.fill.fore_color.rgb = COLORS['white']
-            line.line.fill.background()
-            
-            # 主标题
-            title_box = slide.shapes.add_textbox(Inches(0.8), Inches(2.2), Inches(11.733), Inches(1.2))
-            title_frame = title_box.text_frame
-            title_frame.text = title
-            title_para = title_frame.paragraphs[0]
-            title_para.font.size = Pt(64)
-            title_para.font.bold = True
-            title_para.font.color.rgb = COLORS['white']
-            title_para.alignment = PP_ALIGN.CENTER
-            
-            # 副标题
-            if subtitle:
-                subtitle_box = slide.shapes.add_textbox(Inches(0.8), Inches(3.6), Inches(11.733), Inches(0.8))
-                subtitle_frame = subtitle_box.text_frame
-                subtitle_frame.text = subtitle
-                subtitle_para = subtitle_frame.paragraphs[0]
-                subtitle_para.font.size = Pt(24)
-                subtitle_para.font.color.rgb = COLORS['white']
-                subtitle_para.alignment = PP_ALIGN.CENTER
-            
-            # 底部装饰
-            bottom_bar = slide.shapes.add_shape(
-                MSO_SHAPE.RECTANGLE, Inches(0), Inches(6.8), Inches(13.333), Inches(0.7)
-            )
-            bottom_bar.fill.solid()
-            bottom_bar.fill.fore_color.rgb = COLORS['secondary']
-            bottom_bar.line.fill.background()
-    
-    prs.save(output_path)
-    return output_path
-
-
-async def upload_ppt_to_feishu(file_path: str, title: str) -> str:
-    """上传PPT文件到飞书云空间"""
-    try:
-        token = await feishu_api.get_tenant_access_token()
-        upload_url = "https://open.feishu.cn/open-apis/drive/v1/files/upload_all"
-        
-        with open(file_path, 'rb') as f:
-            file_content = f.read()
-        
-        file_size = len(file_content)
-        file_name = f"{title}.pptx"
-        
-        import httpx
-        
-        headers = {"Authorization": f"Bearer {token}"}
-        
-        files = {
-            'file': (file_name, file_content, 'application/vnd.openxmlformats-officedocument.presentationml.presentation')
-        }
-        
-        data = {
-            'file_name': file_name,
-            'parent_type': 'explorer',
-            'parent_node': 'root',
-            'size': str(file_size)
-        }
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.post(upload_url, headers=headers, data=data, files=files)
-            data = response.json()
-            
-            if data.get("code") == 0:
-                file_token = data["data"]["file_token"]
-                file_url = f"https://open.feishu.cn/open-apis/drive/v1/files/{file_token}"
-                return file_url
-            else:
-                logger.error(f"上传PPT到飞书失败: {data.get('msg')}")
-                return f"file://{file_path}"
-                
-    except Exception as e:
-        logger.error(f"上传PPT到飞书异常: {e}")
-        return f"file://{file_path}"
-
-
-def format_ppt_satisfaction_check(ppt_url: str, ppt_title: str, revision_count: int = 0) -> str:
-    """格式化PPT满意度确认界面"""
-    lines = []
-    lines.append("=" * 60)
-    lines.append("✅ PPT生成完成！")
-    lines.append("=" * 60)
-    lines.append("")
-    lines.append(f"📄 标题: {ppt_title}")
-    lines.append(f"🔗 链接: {ppt_url}")
-    if revision_count > 0:
-        lines.append(f"📝 已修改次数: {revision_count}")
-    lines.append("")
-    lines.append("请查看PPT后选择：")
-    lines.append("")
-    lines.append("  [1] 满意 - PPT符合要求，完成任务")
-    lines.append("  [2] 需要修改 - 在现有PPT基础上调整")
-    lines.append("  [3] 重新生成 - 完全重做（保留大纲，重新生成内容）")
-    lines.append("")
-    lines.append("=" * 60)
-    
-    return "\n".join(lines)
-
-
-async def revise_ppt_content(state: IMState) -> IMState:
-    """根据用户反馈修改PPT内容（在原有基础上修改）"""
-    ppt_content = state.get("ppt_content")
-    ppt_structure = state.get("ppt_structure")
-    feedback = state.get("ppt_satisfaction_feedback", "")
+    ppt_outline = state.get("ppt_outline", {})
     chat_context = state.get("chat_context", "")
     
-    if not ppt_content or not feedback:
-        logger.error("[ppt_generate_node] 缺少PPT内容或修改意见")
-        state["error"] = "缺少PPT内容或修改意见"
-        return state
+    # 检查是否有用户反馈（内容修改的情况）
+    content_feedback = state.get("ppt_content_feedback")
+    current_content = state.get("ppt_content")
     
-    try:
-        logger.info(f"[ppt_generate_node] 根据用户反馈修改PPT: {feedback}")
-        state["messages"].append(f"[ppt_generate_node] 正在根据反馈修改PPT...")
-        
-        # 构建修改消息
-        revision_prompt = f"""你是一个专业的PPT内容修改专家。用户已经对生成的PPT提出了修改意见，请根据意见修改PPT内容。
-
-用户修改意见：{feedback}
-
-请分析用户的修改意见，并逐页调整PPT内容。修改原则：
-1. 保留原有结构和风格
-2. 根据用户意见增删或调整内容
-3. 保持专业性和可读性
-4. 确保修改后的内容更加符合用户需求
-
-请输出修改后的完整PPT内容JSON。"""
-
-        # 将当前PPT内容转换为JSON字符串
-        current_content_json = json.dumps(ppt_content, ensure_ascii=False, indent=2)
-        
-        messages = [
-            SystemMessage(content=revision_prompt),
-            HumanMessage(content=f"当前PPT内容：\n{current_content_json}\n\n请根据用户意见修改。")
-        ]
-        
-        # 调用LLM进行修改
-        res = await ppt_content_agent.ainvoke({"messages": messages})
-        raw_content = res["messages"][-1].content
-        json_str = extract_json(raw_content)
-        
-        try:
-            revised_content = json.loads(json_str)
-            state["ppt_content"] = revised_content
-            logger.info("[ppt_generate_node] PPT内容修改完成")
-            state["messages"].append("[ppt_generate_node] PPT内容修改完成")
-        except json.JSONDecodeError as e:
-            logger.warning(f"[ppt_generate_node] 修改后内容解析失败，使用原内容: {e}")
-            state["messages"].append("[ppt_generate_node] 修改解析失败，将重新渲染原内容")
-        
-        # 重新渲染PPT文件
-        logger.info("[ppt_generate_node] 重新渲染修改后的PPT")
-        state["messages"].append("[ppt_generate_node] 重新渲染PPT文件...")
-        
-        output_dir = os.path.join(os.getcwd(), "output")
-        os.makedirs(output_dir, exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_title = re.sub(r'[^\w\s-]', '', ppt_structure.get("title", "未命名PPT")).strip()
-        revision_count = state.get("ppt_revision_count", 0)
-        file_name = f"{safe_title}_修订{revision_count}_{timestamp}.pptx"
-        file_path = os.path.join(output_dir, file_name)
-        
-        create_ppt_file(ppt_structure, state["ppt_content"], file_path)
-        logger.info(f"[ppt_generate_node] 修改后的PPT文件已生成: {file_path}")
-        state["messages"].append(f"[ppt_generate_node] 修改后的PPT文件已生成")
-        
-        # 重新上传
-        ppt_url = await upload_ppt_to_feishu(file_path, ppt_structure.get("title", "未命名PPT"))
-        state["ppt_url"] = ppt_url
-        
-        # 增加修改次数
-        state["ppt_revision_count"] = revision_count + 1
-        
-        logger.info(f"[ppt_generate_node] 修改后的PPT上传完成: {ppt_url}")
-        state["messages"].append(f"[ppt_generate_node] 修改后的PPT链接: {ppt_url}")
-        
-        # 重置满意度确认状态，准备下一次确认
-        state["ppt_satisfaction_confirmed"] = False
-        state["confirmed"] = False
-        state["need_confirm"] = True
-        state["confirm_type"] = "ppt_satisfaction"
-        
-    except Exception as e:
-        logger.error(f"[ppt_generate_node] PPT修改异常: {e}")
-        state["error"] = f"PPT修改失败: {str(e)}"
-        state["messages"].append(f"[ppt_generate_node] PPT修改失败: {str(e)}")
+    if content_feedback and current_content:
+        # 用户要求修改内容
+        prompt = ppt_content_revision_prompt.format(
+            ppt_outline=json.dumps(ppt_outline, ensure_ascii=False, indent=2),
+            current_content=json.dumps(current_content, ensure_ascii=False, indent=2),
+            user_feedback=content_feedback,
+            context=chat_context
+        )
+        logger.info(f"[ppt_generate_node] 重新生成PPT内容，用户反馈: {content_feedback}")
+    else:
+        # 首次生成内容
+        prompt = ppt_content_prompt.format(
+            ppt_outline=json.dumps(ppt_outline, ensure_ascii=False, indent=2),
+            context=chat_context
+        )
     
-    return state
+    messages = [HumanMessage(content=prompt)]
+    return messages
 
 
-async def generate_ppt_content(state: IMState) -> IMState:
-    """生成PPT详细内容并渲染文件（支持满意度确认）"""
-    ppt_structure = state.get("ppt_structure")
-    chat_context = state.get("chat_context", "")
-    
-    if not ppt_structure:
-        logger.error("[ppt_generate_node] 缺少PPT大纲，无法生成内容")
-        state["error"] = "缺少PPT大纲，无法生成内容"
-        return state
-    
-    # 检查是否是修改后的重新生成
-    satisfaction_feedback = state.get("ppt_satisfaction_feedback")
-    if satisfaction_feedback and state.get("ppt_content"):
-        # 用户要求重新生成，但保留大纲
-        logger.info("[ppt_generate_node] 用户要求重新生成PPT内容（保留大纲）")
-        state["messages"].append("[ppt_generate_node] 根据反馈重新生成PPT内容...")
-        # 清除旧内容，但保留大纲
-        state["ppt_content"] = None
-    
-    # 检查是否已生成过内容（用于满意度确认流程）
-    if state.get("ppt_content") and state.get("ppt_url"):
-        # 已经生成过，进入满意度确认流程
-        if not state.get("ppt_satisfaction_confirmed", False):
-            logger.info("[ppt_generate_node] PPT已生成，等待用户满意度确认")
-            state["messages"].append("[ppt_generate_node] PPT已生成，等待用户确认满意度")
-            
-            ppt_url = state.get("ppt_url", "")
-            ppt_title = ppt_structure.get("title", "未命名PPT")
-            revision_count = state.get("ppt_revision_count", 0)
-            
-            satisfaction_menu = format_ppt_satisfaction_check(ppt_url, ppt_title, revision_count)
-            state["messages"].append(satisfaction_menu)
-            
-            # 设置确认状态
-            state["current_scene_before_confirm"] = "ppt_generate_node"
-            state["need_confirm"] = True
-            state["confirm_type"] = "ppt_satisfaction"
-            state["confirmed"] = False
-            
-            return state
-        else:
-            # 用户已确认满意，流程结束
-            logger.info("[ppt_generate_node] 用户已确认PPT满意")
-            state["messages"].append("[ppt_generate_node] 用户确认PPT满意，任务完成")
-            return state
-    
-    try:
-        logger.info("[ppt_generate_node] Step D2: 逐页生成PPT内容")
-        state["messages"].append("[ppt_generate_node] 逐页生成PPT内容...")
-        
-        slides = ppt_structure.get("slides", [])
-        refined_slides = []
-        
-        for slide in slides:
-            messages = build_ppt_content_messages(ppt_structure, slide, chat_context)
-            res = await ppt_content_agent.ainvoke({"messages": messages})
-            
-            raw_content = res["messages"][-1].content
-            json_str = extract_json(raw_content)
-            
-            try:
-                slide_content = json.loads(json_str)
-                refined_slides.append(slide_content)
-            except json.JSONDecodeError as e:
-                logger.warning(f"[ppt_generate_node] 页面 {slide.get('page')} 内容解析失败，使用原始内容")
-                # 转换旧格式到新格式
-                old_content = slide.get("content", {})
-                points = old_content.get("points", [])
-                refined_slides.append({
-                    "page": slide.get("page"),
-                    "type": slide.get("type"),
-                    "title": slide.get("title"),
-                    "subtitle": slide.get("subtitle", ""),
-                    "content": {
-                        "main_points": [{"title": p, "detail": "", "highlight": ""} for p in points] if points else [],
-                        "visual_suggestions": {"layout": "standard"},
-                        "notes": ""
-                    }
-                })
-        
-        ppt_content = {
-            "title": ppt_structure.get("title"),
-            "ppt_type": ppt_structure.get("ppt_type"),
-            "ppt_style": ppt_structure.get("ppt_style", "business_blue"),
-            "slides": refined_slides
-        }
-        state["ppt_content"] = ppt_content
-        logger.info(f"[ppt_generate_node] PPT内容生成完成，共 {len(refined_slides)} 页")
-        state["messages"].append(f"[ppt_generate_node] PPT内容生成完成，共 {len(refined_slides)} 页")
-        
-        logger.info("[ppt_generate_node] Step D3: 渲染PPT文件")
-        state["messages"].append("[ppt_generate_node] 渲染PPT文件...")
-        
-        output_dir = os.path.join(os.getcwd(), "output")
-        os.makedirs(output_dir, exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_title = re.sub(r'[^\w\s-]', '', ppt_structure.get("title", "未命名PPT")).strip()
-        file_name = f"{safe_title}_{timestamp}.pptx"
-        file_path = os.path.join(output_dir, file_name)
-        
-        create_ppt_file(ppt_structure, ppt_content, file_path)
-        logger.info(f"[ppt_generate_node] PPT文件已生成: {file_path}")
-        state["messages"].append(f"[ppt_generate_node] PPT文件已生成: {file_path}")
-        
-        logger.info("[ppt_generate_node] Step D4: 上传PPT到飞书")
-        state["messages"].append("[ppt_generate_node] 上传PPT到飞书...")
-        
-        ppt_url = await upload_ppt_to_feishu(file_path, ppt_structure.get("title", "未命名PPT"))
-        state["ppt_url"] = ppt_url
-        
-        logger.info(f"[ppt_generate_node] PPT上传完成: {ppt_url}")
-        state["messages"].append(f"[ppt_generate_node] PPT生成完成，链接: {ppt_url}")
-        
-        # 进入满意度确认流程
-        state["ppt_satisfaction_confirmed"] = False
-        state["confirmed"] = False
-        state["need_confirm"] = True
-        state["confirm_type"] = "ppt_satisfaction"
-        state["ppt_revision_count"] = 0  # 初始化修改次数
-        
-        # 显示满意度确认界面
-        satisfaction_menu = format_ppt_satisfaction_check(ppt_url, ppt_structure.get("title", "未命名PPT"), 0)
-        state["messages"].append(satisfaction_menu)
-        
-    except Exception as e:
-        logger.error(f"[ppt_generate_node] PPT内容生成异常: {e}")
-        state["error"] = f"PPT内容生成失败: {str(e)}"
-        state["messages"].append(f"[ppt_generate_node] PPT内容生成失败: {str(e)}")
-    
-    return state
+# ============================================
+# 核心节点函数
+# ============================================
 
-
-# PPT风格选项定义
-PPT_STYLE_OPTIONS = {
-    "business_blue": {
-        "name": "商务蓝",
-        "description": "专业稳重，适合商务汇报、企业介绍",
-        "emoji": "💼",
-        "features": ["蓝色主调", "正式专业", "数据驱动"]
-    },
-    "tech_dark": {
-        "name": "科技黑",
-        "description": "科技感强，适合技术分享、产品发布",
-        "emoji": "💻",
-        "features": ["深色背景", "科技元素", "代码展示"]
-    },
-    "fresh_green": {
-        "name": "清新绿",
-        "description": "亲和自然，适合环保、教育、健康主题",
-        "emoji": "🌿",
-        "features": ["绿色主调", "清新自然", "亲和力强"]
-    },
-    "warm_orange": {
-        "name": "活力橙",
-        "description": "活力热情，适合创意、营销、活动推广",
-        "emoji": "🔥",
-        "features": ["橙色主调", "活力创意", "吸引眼球"]
-    },
-    "minimal_white": {
-        "name": "极简白",
-        "description": "简洁干净，适合学术、研究、极简风格",
-        "emoji": "📄",
-        "features": ["白色为主", "极简设计", "内容聚焦"]
-    },
-    "elegant_purple": {
-        "name": "优雅紫",
-        "description": "高端精致，适合时尚、艺术、品牌展示",
-        "emoji": "💜",
-        "features": ["紫色渐变", "优雅精致", "品质感强"]
-    }
-}
-
-
-def format_style_selection() -> str:
-    """格式化风格选择界面"""
-    lines = []
-    lines.append("=" * 60)
-    lines.append("🎨 请选择PPT风格模板")
-    lines.append("=" * 60)
-    lines.append("")
-    
-    for key, style in PPT_STYLE_OPTIONS.items():
-        lines.append(f"{style['emoji']} [{key}] {style['name']}")
-        lines.append(f"   描述: {style['description']}")
-        lines.append(f"   特点: {', '.join(style['features'])}")
-        lines.append("")
-    
-    lines.append("=" * 60)
-    lines.append("请输入风格名称（如: business_blue）或序号（1-6）")
-    lines.append("• 输入 'auto' 让系统自动推荐")
-    lines.append("• 输入 'cancel' 取消PPT生成")
-    lines.append("=" * 60)
-    
-    return "\n".join(lines)
-
-
-def parse_style_selection(user_input: str) -> tuple:
-    """解析用户风格选择
+def get_ppt_generation_stage(state: IMState) -> str:
+    """判断当前PPT生成阶段
     
     Returns:
-        (style_key, is_valid, message)
+        - "outline": 需要生成大纲
+        - "content": 需要生成内容
+        - "file": 需要制作文件
+        - "complete": 已完成
     """
-    user_input = user_input.strip().lower()
+    ppt_outline = state.get("ppt_outline")
+    ppt_content = state.get("ppt_content")
+    ppt_url = state.get("ppt_url")
     
-    if user_input in ['cancel', '取消', 'q', 'quit']:
-        return None, False, "cancelled"
-    
-    if user_input in ['auto', '自动', '推荐']:
-        return "auto", True, "将自动根据主题推荐风格"
-    
-    # 检查是否是数字序号
-    try:
-        num = int(user_input)
-        style_keys = list(PPT_STYLE_OPTIONS.keys())
-        if 1 <= num <= len(style_keys):
-            return style_keys[num - 1], True, f"已选择: {PPT_STYLE_OPTIONS[style_keys[num - 1]]['name']}"
-    except ValueError:
-        pass
-    
-    # 检查是否是风格名称
-    if user_input in PPT_STYLE_OPTIONS:
-        return user_input, True, f"已选择: {PPT_STYLE_OPTIONS[user_input]['name']}"
-    
-    # 模糊匹配
-    for key, style in PPT_STYLE_OPTIONS.items():
-        if user_input in style['name'].lower() or user_input in key.lower():
-            return key, True, f"已选择: {style['name']}"
-    
-    return None, False, f"无效的选择 '{user_input}'，请重新输入"
+    if ppt_url:
+        return "complete"
+    if ppt_content:
+        return "file"
+    if ppt_outline:
+        return "content"
+    return "outline"
 
 
 async def ppt_generate_node(state: IMState) -> IMState:
-    """场景D：PPT生成
+    """PPT生成主节点
     
-    完整执行流程:
-    1. 检查用户是否已选择风格
-       - 未选择: 显示风格选项，等待用户选择
-       - 已选择: 继续下一步
-    2. 检查用户是否已确认大纲
-       - 未确认: 生成大纲，等待用户确认
-       - 已确认: 执行内容生成
-    3. 检查用户满意度
-       - 未确认: 显示满意度确认界面
-       - 满意: 任务完成
-       - 需要修改: 在原有基础上修改
-       - 重新生成: 保留大纲，重新生成内容
+    执行流程:
+    Step 1: 检查用户确认状态
+      - 如果是首次进入：生成大纲 → 设置need_confirm=True → 返回等待确认
+      - 如果用户已确认大纲(confirmed=True, confirm_type=ppt_outline)：执行内容生成
+      - 如果用户已确认内容(confirmed=True, confirm_type=ppt_content)：执行PPT文件制作
+      - 如果用户要求修改(confirmed=False, cancelled=False)：重新生成
+      - 如果用户取消(cancelled=True)：直接返回
     """
     state["current_scene"] = "ppt_generate_node"
     state["messages"].append("[ppt_generate_node] 进入PPT生成节点")
     
+    # 检查用户是否取消了任务
     if state.get("cancelled"):
         logger.info("[ppt_generate_node] 用户已取消任务，跳过PPT生成")
         state["messages"].append("[ppt_generate_node] 用户取消任务，跳过执行")
         return state
     
-    # Step 1: 检查风格选择
-    ppt_style_selected = state.get("ppt_style_selected")
-    ppt_style_confirmed = state.get("ppt_style_confirmed", False)
+    # 获取确认类型和确认状态
+    confirm_type = state.get("confirm_type", "")
+    confirmed = state.get("confirmed", False)
     
-    if not ppt_style_confirmed:
-        # 用户还未选择风格，显示风格选项
-        logger.info("[ppt_generate_node] 等待用户选择PPT风格")
-        state["messages"].append("[ppt_generate_node] 请用户选择PPT风格")
-        
-        style_menu = format_style_selection()
-        state["messages"].append(style_menu)
-        
-        # 设置状态，让ConfirmNode知道这是风格选择
-        state["current_scene_before_confirm"] = "ppt_generate_node"
-        state["need_confirm"] = True
-        state["confirm_type"] = "style_selection"
-        state["confirmed"] = False
-        
+    # 检查当前阶段
+    stage = get_ppt_generation_stage(state)
+    logger.info(f"[ppt_generate_node] 当前PPT生成阶段: {stage}")
+    
+    # 根据阶段和确认状态执行相应逻辑
+    if stage == "complete":
+        # PPT已生成完成，直接返回
+        logger.info("[ppt_generate_node] PPT已生成完成")
+        state["messages"].append("[ppt_generate_node] PPT已生成完成")
         return state
     
-    # Step 2: 检查是否需要修改PPT（满意度确认后的修改）
-    revision_type = state.get("ppt_revision_type")
-    satisfaction_feedback = state.get("ppt_satisfaction_feedback")
-    
-    if revision_type == "revise" and satisfaction_feedback:
-        # 用户要求在原有基础上修改
-        logger.info("[ppt_generate_node] 用户要求修改PPT内容")
-        state["messages"].append("[ppt_generate_node] 开始修改PPT内容")
-        
-        # 清除修改类型标记，避免重复修改
-        state["ppt_revision_type"] = None
-        
-        return await revise_ppt_content(state)
-    
-    if revision_type == "regenerate" and satisfaction_feedback:
-        # 用户要求重新生成（保留大纲）
-        logger.info("[ppt_generate_node] 用户要求重新生成PPT")
-        state["messages"].append("[ppt_generate_node] 开始重新生成PPT内容")
-        
-        # 清除修改类型标记和内容
-        state["ppt_revision_type"] = None
-        state["ppt_content"] = None
-        state["ppt_url"] = ""
-        
-        # 重新生成内容
-        return await generate_ppt_content(state)
-    
-    # Step 3: 检查大纲确认
-    ppt_structure = state.get("ppt_structure")
-    confirmed = state.get("confirmed", False)
-    ppt_outline_feedback = state.get("ppt_outline_feedback")
-
-    if ppt_structure and confirmed:
-        # 用户已确认大纲，开始生成内容
-        # 但先检查是否已经生成过内容（满意度确认流程）
-        if state.get("ppt_content") and state.get("ppt_url"):
-            # 已经生成过内容，进入满意度确认
+    if stage == "file":
+        # 已有内容，需要制作文件
+        if confirm_type == "ppt_content" and confirmed:
+            # 用户已确认内容，执行PPT文件制作
+            logger.info("[ppt_generate_node] 用户已确认PPT内容，开始制作PPT文件")
+            state["messages"].append("[ppt_generate_node] 用户确认内容，开始制作PPT文件")
+            state = await generate_ppt_file(state)
+            # 文件生成完成后，标记为完成
+            if state.get("ppt_url"):
+                state["ppt_generation_completed"] = True
+            return state
+        elif state.get("ppt_content_feedback"):
+            # 用户要求修改内容
+            logger.info("[ppt_generate_node] 用户要求修改PPT内容，重新生成")
+            state["messages"].append("[ppt_generate_node] 根据用户反馈重新生成PPT内容")
+            state["confirmed"] = False
+            state["need_confirm"] = True
+            state["confirm_type"] = "ppt_content"
             return await generate_ppt_content(state)
-        
-        logger.info("[ppt_generate_node] 用户已确认大纲，开始生成PPT内容")
-        state["messages"].append("[ppt_generate_node] 用户确认大纲，开始生成内容")
-        return await generate_ppt_content(state)
+        else:
+            # 内容已生成但未确认，等待确认
+            logger.info("[ppt_generate_node] PPT内容已生成，等待用户确认")
+            state["need_confirm"] = True
+            state["confirm_type"] = "ppt_content"
+            return state
     
-    if ppt_structure and ppt_outline_feedback:
-        logger.info("[ppt_generate_node] 用户要求修改大纲，重新生成")
-        state["messages"].append("[ppt_generate_node] 根据用户反馈重新生成大纲")
-        state["confirmed"] = False
-        state["need_confirm"] = True
-        state["confirm_type"] = "outline_confirmation"
-    else:
-        logger.info("[ppt_generate_node] 首次生成PPT大纲")
-        state["messages"].append("[ppt_generate_node] 首次生成PPT大纲")
+    if stage == "content":
+        # 已有大纲，需要生成内容
+        if confirm_type == "ppt_outline" and confirmed:
+            # 用户已确认大纲，执行内容生成
+            logger.info("[ppt_generate_node] 用户已确认大纲，开始生成PPT内容")
+            state["messages"].append("[ppt_generate_node] 用户确认大纲，开始生成PPT内容")
+            return await generate_ppt_content(state)
+        elif state.get("ppt_outline_feedback"):
+            # 用户要求修改大纲
+            logger.info("[ppt_generate_node] 用户要求修改大纲，重新生成")
+            state["messages"].append("[ppt_generate_node] 根据用户反馈重新生成大纲")
+            state["confirmed"] = False
+            state["need_confirm"] = True
+            state["confirm_type"] = "ppt_outline"
+            return await generate_ppt_outline(state)
+        else:
+            # 大纲已生成但未确认，等待确认
+            logger.info("[ppt_generate_node] PPT大纲已生成，等待用户确认")
+            state["need_confirm"] = True
+            state["confirm_type"] = "ppt_outline"
+            return state
     
+    # stage == "outline": 首次进入，生成大纲
+    logger.info("[ppt_generate_node] 首次生成PPT大纲")
+    state["messages"].append("[ppt_generate_node] 首次生成PPT大纲")
+    return await generate_ppt_outline(state)
+
+
+async def generate_ppt_outline(state: IMState) -> IMState:
+    """生成PPT大纲"""
     try:
-        messages = build_ppt_outline_messages(state)
+        messages = build_outline_messages(state)
         
-        if ppt_outline_feedback and ppt_structure:
+        # 根据是否有用户反馈选择不同的agent
+        outline_feedback = state.get("ppt_outline_feedback")
+        current_outline = state.get("ppt_outline")
+        
+        if outline_feedback and current_outline:
             res = await ppt_outline_revision_agent.ainvoke({"messages": messages})
         else:
             res = await ppt_outline_agent.ainvoke({"messages": messages})
         
         raw_content = res["messages"][-1].content
-        json_str = extract_json(raw_content)
+        json_content = extract_json(raw_content)
         
         try:
-            ppt_structure = json.loads(json_str)
+            ppt_outline = json.loads(json_content)
         except json.JSONDecodeError as e:
-            logger.error(f"[ppt_generate_node] PPT结构JSON解析失败: {e}")
+            logger.error(f"[ppt_generate_node] PPT大纲JSON解析失败: {e}")
             logger.error(f"[ppt_generate_node] 原始内容: {raw_content}")
-            state["error"] = f"PPT结构解析失败: {e}"
+            state["error"] = f"PPT大纲解析失败: {e}"
             return state
         
-        state["ppt_structure"] = ppt_structure
+        state["ppt_outline"] = ppt_outline
         state["current_scene_before_confirm"] = "ppt_generate_node"
+        state["confirm_type"] = "ppt_outline"
         state["need_confirm"] = True
         state["confirmed"] = False
-        state["confirm_type"] = "outline_confirmation"
         
+        # 清理反馈信息
         state.pop("ppt_outline_feedback", None)
         
-        # 显示风格信息
-        selected_style = state.get("ppt_style_selected", "business_blue")
-        style_name = PPT_STYLE_OPTIONS.get(selected_style, {}).get("name", "商务蓝")
-        
-        formatted_outline = format_ppt_outline(ppt_structure)
-        logger.info(f"[ppt_generate_node] PPT大纲生成完成 (风格: {style_name}):\n{formatted_outline}")
-        state["messages"].append(f"[ppt_generate_node] 已选择风格: {style_name}")
+        logger.info(f"[ppt_generate_node] PPT大纲生成完成: {ppt_outline.get('title')}")
         state["messages"].append(f"[ppt_generate_node] PPT大纲生成完成，等待用户确认")
-        state["messages"].append(formatted_outline)
+        
+        # 记录大纲摘要到日志
+        logger.info(f"[ppt_generate_node] 大纲摘要:\n{format_ppt_outline(ppt_outline)}")
         
     except Exception as e:
-        logger.error(f"[ppt_generate_node] PPT大纲生成异常: {e}")
-        state["error"] = f"PPT大纲生成失败: {str(e)}"
-        state["messages"].append(f"[ppt_generate_node] PPT大纲生成失败: {str(e)}")
+        logger.error(f"[ppt_generate_node] 生成PPT大纲时出错: {e}")
+        state["error"] = f"生成PPT大纲失败: {str(e)}"
     
     return state
+
+
+async def generate_ppt_content(state: IMState) -> IMState:
+    """生成PPT详细内容（在用户确认大纲后调用）"""
+    try:
+        ppt_outline = state.get("ppt_outline")
+        if not ppt_outline:
+            logger.error("[ppt_generate_node] 缺少PPT大纲，无法生成内容")
+            state["error"] = "缺少PPT大纲，无法生成内容"
+            return state
+        
+        messages = build_content_messages(state)
+        
+        # 根据是否有用户反馈选择不同的agent
+        content_feedback = state.get("ppt_content_feedback")
+        current_content = state.get("ppt_content")
+        
+        if content_feedback and current_content:
+            res = await ppt_content_revision_agent.ainvoke({"messages": messages})
+        else:
+            res = await ppt_content_agent.ainvoke({"messages": messages})
+        
+        raw_content = res["messages"][-1].content
+        json_content = extract_json(raw_content)
+        
+        try:
+            ppt_content = json.loads(json_content)
+        except json.JSONDecodeError as e:
+            logger.error(f"[ppt_generate_node] PPT内容JSON解析失败: {e}")
+            logger.error(f"[ppt_generate_node] 原始内容: {raw_content}")
+            state["error"] = f"PPT内容解析失败: {e}"
+            return state
+        
+        state["ppt_content"] = ppt_content
+        state["current_scene_before_confirm"] = "ppt_generate_node"
+        state["confirm_type"] = "ppt_content"
+        state["need_confirm"] = True
+        state["confirmed"] = False
+        
+        # 清理反馈信息
+        state.pop("ppt_content_feedback", None)
+        
+        logger.info(f"[ppt_generate_node] PPT内容生成完成: {ppt_content.get('title')}")
+        state["messages"].append(f"[ppt_generate_node] PPT内容生成完成，等待用户确认")
+        
+        # 记录内容摘要到日志
+        logger.info(f"[ppt_generate_node] 内容摘要:\n{format_ppt_content(ppt_content)}")
+        
+    except Exception as e:
+        logger.error(f"[ppt_generate_node] 生成PPT内容时出错: {e}")
+        state["error"] = f"生成PPT内容失败: {str(e)}"
+    
+    return state
+
+
+# ============================================
+# PPT文件制作功能 - 基于SKILL.md设计规范
+# ============================================
+
+# 全套配色方案（来自SKILL.md）
+COLOR_SCHEMES = {
+    'Midnight Executive': {'primary': '1E2761', 'secondary': 'CADCFC', 'accent': 'FFFFFF'},
+    'Forest & Moss': {'primary': '2C5F2D', 'secondary': '97BC62', 'accent': 'F5F5F5'},
+    'Coral Energy': {'primary': 'F96167', 'secondary': 'F9E795', 'accent': '2F3C7E'},
+    'Warm Terracotta': {'primary': 'B85042', 'secondary': 'E7E8D1', 'accent': 'A7BEAE'},
+    'Ocean Gradient': {'primary': '065A82', 'secondary': '1C7293', 'accent': '21295C'},
+    'Charcoal Minimal': {'primary': '36454F', 'secondary': 'F2F2F2', 'accent': '212121'},
+    'Teal Trust': {'primary': '028090', 'secondary': '00A896', 'accent': '02C39A'},
+    'Berry & Cream': {'primary': '6D2E46', 'secondary': 'A26769', 'accent': 'ECE2D0'},
+    'Sage Calm': {'primary': '84B59F', 'secondary': '69A297', 'accent': '50808E'},
+    'Cherry Bold': {'primary': '990011', 'secondary': 'FCF6F5', 'accent': '2F3C7E'},
+}
+
+# 字体搭配
+FONT_PAIRINGS = {
+    'elegant': {'header': 'Georgia', 'body': 'Calibri'},
+    'bold': {'header': 'Arial Black', 'body': 'Arial'},
+    'clean': {'header': 'Calibri', 'body': 'Calibri Light'},
+    'professional': {'header': 'Cambria', 'body': 'Calibri'},
+    'modern': {'header': 'Trebuchet MS', 'body': 'Calibri'},
+    'classic': {'header': 'Palatino', 'body': 'Garamond'},
+    'technical': {'header': 'Consolas', 'body': 'Calibri'},
+}
+
+DEFAULT_FONTS = {'header': 'Arial', 'body': 'Arial'}
+
+
+def resolve_color_scheme(ppt_content: dict) -> dict:
+    """根据content中的design或标题智能选择配色"""
+    design = ppt_content.get('design', {})
+    scheme_name = design.get('color_scheme', '')
+
+    if scheme_name and scheme_name in COLOR_SCHEMES:
+        scheme = COLOR_SCHEMES[scheme_name]
+    else:
+        # 根据标题智能选择
+        title = ppt_content.get('title', '')
+        title_lower = title.lower()
+        if any(w in title_lower for w in ['报告', '汇报', '总结', 'review', 'report']):
+            scheme = COLOR_SCHEMES['Midnight Executive']
+        elif any(w in title_lower for w in ['培训', '教学', 'course', 'training']):
+            scheme = COLOR_SCHEMES['Warm Terracotta']
+        elif any(w in title_lower for w in ['创意', '创新', 'creative', 'innovation']):
+            scheme = COLOR_SCHEMES['Coral Energy']
+        elif any(w in title_lower for w in ['环保', '自然', 'environment', 'nature']):
+            scheme = COLOR_SCHEMES['Forest & Moss']
+        elif any(w in title_lower for w in ['极简', '简约', 'minimal']):
+            scheme = COLOR_SCHEMES['Charcoal Minimal']
+        elif any(w in title_lower for w in ['发布', '营销', 'launch', 'marketing']):
+            scheme = COLOR_SCHEMES['Cherry Bold']
+        else:
+            scheme = COLOR_SCHEMES['Ocean Gradient']
+
+    return {
+        'primary': scheme['primary'],
+        'secondary': scheme['secondary'],
+        'accent': scheme['accent'],
+        'text': '333333',
+        'textLight': '666666',
+    }
+
+
+def resolve_font_pairing(ppt_content: dict) -> dict:
+    """根据content中的design解析字体搭配"""
+    design = ppt_content.get('design', {})
+    pair = design.get('font_pairing', {})
+    if isinstance(pair, dict) and 'header' in pair:
+        return pair
+    return DEFAULT_FONTS
+
+
+def generate_pptxgenjs_code(ppt_content: dict, output_path: str) -> str:
+    """根据PPT内容生成PptxGenJS代码（含丰富布局）"""
+    output_path_js = output_path.replace('\\', '/')
+    title = escape_js_string(ppt_content.get('title', '未命名PPT'))
+    slides = ppt_content.get('slides', [])
+    colors = resolve_color_scheme(ppt_content)
+    fonts = resolve_font_pairing(ppt_content)
+
+    header_font = fonts['header']
+    body_font = fonts['body']
+
+    js_code = f"""const pptxgen = require("pptxgenjs");
+
+let pres = new pptxgen();
+pres.layout = 'LAYOUT_16x9';
+pres.author = 'AI Assistant';
+pres.title = '{title}';
+pres.subject = '{title}';
+
+// ── 配色方案 ──
+const C = {{
+    primary: "{colors['primary']}",
+    secondary: "{colors['secondary']}",
+    accent: "{colors['accent']}",
+    text: "{colors['text']}",
+    textLight: "{colors['textLight']}",
+}};
+
+// ── 字体 ──
+const F = {{ header: "{header_font}", body: "{body_font}" }};
+
+// ── Slide Master ──
+pres.defineSlideMaster({{
+    title: 'MASTER_SLIDE',
+    background: {{ color: 'FFFFFF' }},
+    objects: [
+        {{ rect: {{ x: 0, y: 0, w: '100%', h: 0.06, fill: {{ color: C.primary }} }} }},
+        {{ rect: {{ x: 0, y: 5.525, w: '100%', h: 0.1, fill: {{ color: C.primary, transparency: 90 }} }} }},
+    ]
+}});
+
+"""
+
+    for slide in slides:
+        slide_type = slide.get('type', 'content')
+        if slide_type == 'cover':
+            js_code += _gen_cover(slide, colors, fonts)
+        elif slide_type == 'table_of_contents':
+            js_code += _gen_toc(slide, colors, fonts)
+        elif slide_type == 'section_divider':
+            js_code += _gen_section_divider(slide, colors, fonts)
+        elif slide_type == 'final':
+            js_code += _gen_final(slide, colors, fonts)
+        else:
+            js_code += _gen_content(slide, colors, fonts)
+
+    js_code += f"""
+pres.writeFile({{ fileName: "{output_path_js}" }})
+    .then(() => console.log("OK:{output_path_js}"))
+    .catch(err => console.error("ERR:", err));
+"""
+    return js_code
+
+
+# ── 封面 ──
+def _gen_cover(slide: dict, colors: dict, fonts: dict) -> str:
+    t = escape_js_string(slide.get('title', ''))
+    st = escape_js_string(slide.get('subtitle', ''))
+    date_str = escape_js_string(datetime.now().strftime('%Y年%m月%d日'))
+    hf = fonts['header']
+    return f'''
+(function(){{
+let s = pres.addSlide();
+s.background = {{ color: C.primary }};
+s.addShape(pres.shapes.RECTANGLE, {{
+    x: 0, y: 0, w: 10, h: 5.625,
+    fill: {{ color: C.primary, transparency: 10 }}
+}});
+// 装饰线
+s.addShape(pres.shapes.RECTANGLE, {{
+    x: 0.8, y: 2.0, w: 0.08, h: 1.8,
+    fill: {{ color: C.accent, transparency: 20 }}
+}});
+s.addText("{t}", {{
+    x: 1.2, y: 2.0, w: 8, h: 1.4,
+    fontSize: 44, fontFace: "{hf}", bold: true,
+    color: C.accent, align: "left", valign: "middle", margin: 0
+}});
+if ("{st}") {{
+s.addText("{st}", {{
+    x: 1.2, y: 3.6, w: 8, h: 0.7,
+    fontSize: 22, fontFace: "{fonts['body']}",
+    color: C.secondary, align: "left", valign: "middle", margin: 0
+}});
+}}
+s.addText("{date_str}", {{
+    x: 1.2, y: 4.6, w: 4, h: 0.4,
+    fontSize: 13, fontFace: "{fonts['body']}",
+    color: C.secondary, align: "left", margin: 0
+}});
+}})();
+'''
+
+
+# ── 目录 ──
+def _gen_toc(slide: dict, colors: dict, fonts: dict) -> str:
+    t = escape_js_string(slide.get('title', '目录'))
+    items = slide.get('bullets', []) or slide.get('content', [])
+    hf = fonts['header']
+    bf = fonts['body']
+    rows = []
+    for i, item in enumerate(items, 1):
+        txt = escape_js_string(str(item))
+        rows.append(f'  {{ text: "{{i}}", options: {{ fontSize: 14, fontFace: "{bf}", color: C.accent, bold: true, breakLine: true }} }},')
+        rows.append(f'  {{ text: "{txt}", options: {{ fontSize: 18, fontFace: "{bf}", color: C.text, bullet: false, breakLine: true }} }},')
+    rows_code = '\n'.join(rows)
+
+    return f'''
+(function(){{
+let s = pres.addSlide({{ masterName: "MASTER_SLIDE" }});
+s.addText("{t}", {{
+    x: 0.8, y: 0.4, w: 8.4, h: 0.7,
+    fontSize: 36, fontFace: "{hf}", bold: true,
+    color: C.primary, margin: 0
+}});
+// 下划线装饰
+s.addShape(pres.shapes.RECTANGLE, {{
+    x: 0.8, y: 1.15, w: 1.2, h: 0.04,
+    fill: {{ color: C.primary }}
+}});
+s.addText([
+{rows_code}
+], {{
+    x: 1.2, y: 1.6, w: 7.6, h: 3.5,
+    valign: "top", lineSpacing: 28
+}});
+}})();
+'''
+
+
+# ── 章节分隔页 ──
+def _gen_section_divider(slide: dict, colors: dict, fonts: dict) -> str:
+    t = escape_js_string(slide.get('title', ''))
+    st = escape_js_string(slide.get('subtitle', ''))
+    hf = fonts['header']
+    return f'''
+(function(){{
+let s = pres.addSlide();
+s.background = {{ color: C.primary }};
+s.addText("{t}", {{
+    x: 0.8, y: 1.8, w: 8.4, h: 1.2,
+    fontSize: 48, fontFace: "{hf}", bold: true,
+    color: C.accent, align: "center", valign: "middle", margin: 0
+}});
+if ("{st}") {{
+s.addText("{st}", {{
+    x: 0.8, y: 3.2, w: 8.4, h: 0.8,
+    fontSize: 24, fontFace: "{fonts['body']}",
+    color: C.secondary, align: "center", valign: "middle", margin: 0
+}});
+}}
+}})();
+'''
+
+
+# ── 结束页 ──
+def _gen_final(slide: dict, colors: dict, fonts: dict) -> str:
+    t = escape_js_string(slide.get('title', '感谢观看'))
+    bullets = slide.get('bullets', []) or slide.get('content', [])
+    lines = [escape_js_string(str(b)) for b in bullets]
+    hf = fonts['header']
+    bf = fonts['body']
+    if lines:
+        text_arr = ',\n        '.join(
+            [f'{{ text: "{l}", options: {{ breakLine: true, fontSize: 16, fontFace: "{bf}", color: C.secondary, align: "center" }} }}' for l in lines]
+        )
+        extra = f'''
+s.addText([
+    {text_arr}
+], {{
+    x: 1, y: 3.8, w: 8, h: 1.2,
+    align: "center", valign: "top"
+}});
+'''
+    else:
+        extra = ''
+
+    return f'''
+(function(){{
+let s = pres.addSlide();
+s.background = {{ color: C.primary }};
+// 装饰线
+s.addShape(pres.shapes.RECTANGLE, {{
+    x: 0.8, y: 2.0, w: 0.08, h: 1.8,
+    fill: {{ color: C.accent, transparency: 20 }}
+}});
+s.addText("{t}", {{
+    x: 1.2, y: 2.0, w: 8, h: 1.4,
+    fontSize: 48, fontFace: "{hf}", bold: true,
+    color: C.accent, align: "left", valign: "middle", margin: 0
+}});
+{extra}
+}})();
+'''
+
+
+# ── 内容页路由 ──
+def _gen_content(slide: dict, colors: dict, fonts: dict) -> str:
+    design = slide.get('design', {}) or {}
+    layout_variant = design.get('layout_variant', '')
+
+    # 兼容旧格式
+    if not layout_variant:
+        old_layout = slide.get('layout', '')
+        if old_layout == 'two_column':
+            layout_variant = 'two_column'
+        else:
+            layout_variant = 'standard'
+
+    if layout_variant == 'data_callout':
+        return _gen_data_callout(slide, colors, fonts)
+    elif layout_variant == 'timeline':
+        return _gen_timeline(slide, colors, fonts)
+    elif layout_variant == 'chart':
+        return _gen_chart_slide(slide, colors, fonts)
+    elif layout_variant == 'two_column':
+        return _gen_two_column(slide, colors, fonts)
+    else:
+        return _gen_standard(slide, colors, fonts)
+
+
+# ── 标准内容（标题 + 要点 + 左装饰条） ──
+def _gen_standard(slide: dict, colors: dict, fonts: dict) -> str:
+    t = escape_js_string(slide.get('title', ''))
+    bullets = slide.get('bullets', [])
+    if not bullets:
+        bullets = slide.get('content', [])
+    hf = fonts['header']
+    bf = fonts['body']
+
+    items = []
+    for b in bullets:
+        txt = escape_js_string(str(b))
+        items.append(f'{{ text: "{txt}", options: {{ bullet: true, breakLine: true, fontSize: 18, fontFace: "{bf}", color: C.text }} }}')
+    bullets_code = ',\n        '.join(items) if items else ''
+
+    return f'''
+(function(){{
+let s = pres.addSlide({{ masterName: "MASTER_SLIDE" }});
+// 标题区
+s.addShape(pres.shapes.RECTANGLE, {{
+    x: 0, y: 0, w: 10, h: 0.9,
+    fill: {{ color: C.primary, transparency: 95 }}
+}});
+// 左装饰条
+s.addShape(pres.shapes.RECTANGLE, {{
+    x: 0.3, y: 0.2, w: 0.06, h: 0.5,
+    fill: {{ color: C.primary }}
+}});
+s.addText("{t}", {{
+    x: 0.6, y: 0.15, w: 8.8, h: 0.6,
+    fontSize: 30, fontFace: "{hf}", bold: true,
+    color: C.primary, margin: 0
+}});
+// 底部装饰线
+s.addShape(pres.shapes.RECTANGLE, {{
+    x: 0.5, y: 5.2, w: 9, h: 0.02,
+    fill: {{ color: C.primary, transparency: 85 }}
+}});
+// Bullet内容
+s.addText([
+    {bullets_code}
+], {{
+    x: 0.7, y: 1.2, w: 8.6, h: 3.8,
+    valign: "top", paraSpaceAfter: 8
+}});
+}})();
+'''
+
+
+# ── 双栏布局 ──
+def _gen_two_column(slide: dict, colors: dict, fonts: dict) -> str:
+    t = escape_js_string(slide.get('title', ''))
+    bullets = slide.get('bullets', [])
+    if not bullets:
+        bullets = slide.get('content', [])
+    hf = fonts['header']
+    bf = fonts['body']
+
+    # 平分到两栏
+    mid = max(1, len(bullets) // 2 if len(bullets) % 2 == 0 else len(bullets) // 2 + 1)
+    left_items = bullets[:mid]
+    right_items = bullets[mid:]
+
+    def col_text(items, side_label=''):
+        arr = []
+        if side_label:
+            arr.append(f'{{ text: "{side_label}", options: {{ bold: true, fontSize: 14, fontFace: "{bf}", color: C.accent, breakLine: true }} }}')
+        for b in items:
+            txt = escape_js_string(str(b))
+            arr.append(f'{{ text: "{txt}", options: {{ bullet: true, breakLine: true, fontSize: 15, fontFace: "{bf}", color: C.text }} }}')
+        return ',\n        '.join(arr) if arr else ''
+
+    l_code = col_text(left_items)
+    r_code = col_text(right_items)
+
+    return f'''
+(function(){{
+let s = pres.addSlide({{ masterName: "MASTER_SLIDE" }});
+s.addText("{t}", {{
+    x: 0.6, y: 0.15, w: 8.8, h: 0.6,
+    fontSize: 30, fontFace: "{hf}", bold: true,
+    color: C.primary, margin: 0
+}});
+// 左栏背景
+s.addShape(pres.shapes.RECTANGLE, {{
+    x: 0.4, y: 1.0, w: 4.4, h: 3.8,
+    fill: {{ color: C.primary, transparency: 93 }}
+}});
+// 右栏背景
+s.addShape(pres.shapes.RECTANGLE, {{
+    x: 5.2, y: 1.0, w: 4.4, h: 3.8,
+    fill: {{ color: C.primary, transparency: 93 }}
+}});
+// 左栏内容
+s.addText([
+    {l_code}
+], {{
+    x: 0.6, y: 1.2, w: 4.0, h: 3.4,
+    valign: "top", paraSpaceAfter: 6
+}});
+// 右栏内容
+s.addText([
+    {r_code}
+], {{
+    x: 5.4, y: 1.2, w: 4.0, h: 3.4,
+    valign: "top", paraSpaceAfter: 6
+}});
+// 底部装饰线
+s.addShape(pres.shapes.RECTANGLE, {{
+    x: 0.5, y: 5.2, w: 9, h: 0.02,
+    fill: {{ color: C.primary, transparency: 85 }}
+}});
+}})();
+'''
+
+
+# ── 数据高亮（大号数字） ──
+def _gen_data_callout(slide: dict, colors: dict, fonts: dict) -> str:
+    t = escape_js_string(slide.get('title', ''))
+    bullets = slide.get('bullets', [])
+    design = slide.get('design', {})
+    callout_data = design.get('callout_data', [])
+
+    if not callout_data:
+        # fallback: 用bullets首条
+        for b in bullets[:3]:
+            parts = str(b).split('：', 1)
+            if len(parts) == 2:
+                callout_data.append({'value': parts[0], 'label': parts[1]})
+            else:
+                callout_data.append({'value': parts[0], 'label': ''})
+
+    hf = fonts['header']
+    bf = fonts['body']
+    n = len(callout_data)
+    col_w = 8.0 / max(n, 1)
+    start_x = 1.0
+    cards = []
+    for i, cd in enumerate(callout_data):
+        val = escape_js_string(cd.get('value', ''))
+        lbl = escape_js_string(cd.get('label', ''))
+        cx = start_x + i * col_w
+        cards.append(f'''
+// 数据卡片 {i+1}
+s.addShape(pres.shapes.RECTANGLE, {{
+    x: {cx}, y: 2.8, w: {col_w - 0.3}, h: 2.0,
+    fill: {{ color: C.primary, transparency: 93 }},
+    shadow: {{ type: "outer", blur: 4, offset: 1, color: "000000", opacity: 0.08 }}
+}});
+s.addText("{val}", {{
+    x: {cx}, y: 2.9, w: {col_w - 0.3}, h: 1.0,
+    fontSize: 32, fontFace: "{hf}", bold: true,
+    color: C.primary, align: "center", valign: "bottom", margin: 0
+}});
+s.addText("{lbl}", {{
+    x: {cx}, y: 3.9, w: {col_w - 0.3}, h: 0.7,
+    fontSize: 14, fontFace: "{bf}",
+    color: C.textLight, align: "center", valign: "top", margin: 0
+}});
+''')
+
+    cards_code = '\n'.join(cards)
+    bf_code = ',\n        '.join(
+        [f'{{ text: "{escape_js_string(str(b))}", options: {{ bullet: true, breakLine: true, fontSize: 15, fontFace: "{bf}", color: C.text }} }}' for b in bullets]
+    ) if bullets else ''
+
+    return f'''
+(function(){{
+let s = pres.addSlide({{ masterName: "MASTER_SLIDE" }});
+s.addText("{t}", {{
+    x: 0.6, y: 0.15, w: 8.8, h: 0.6,
+    fontSize: 30, fontFace: "{hf}", bold: true,
+    color: C.primary, margin: 0
+}});
+{cards_code}
+'''.rstrip() + (f'''
+s.addText([
+    {bf_code}
+], {{
+    x: 0.7, y: 1.0, w: 8.6, h: 1.5,
+    valign: "top", paraSpaceAfter: 4
+}});
+''' if bf_code else '') + f'''
+// 底部装饰线
+s.addShape(pres.shapes.RECTANGLE, {{
+    x: 0.5, y: 5.2, w: 9, h: 0.02,
+    fill: {{ color: C.primary, transparency: 85 }}
+}});
+}})();
+'''
+
+
+# ── 时间线/流程步骤 ──
+def _gen_timeline(slide: dict, colors: dict, fonts: dict) -> str:
+    t = escape_js_string(slide.get('title', ''))
+    bullets = slide.get('bullets', [])
+    if not bullets:
+        bullets = slide.get('content', [])
+    hf = fonts['header']
+    bf = fonts['body']
+    n = len(bullets)
+    if n == 0:
+        return _gen_standard(slide, colors, fonts)
+
+    step_w = min(2.8, 8.4 / max(n, 1))
+    steps = []
+    for i, b in enumerate(bullets):
+        txt = escape_js_string(str(b))
+        sx = 0.8 + i * (step_w + 0.2)
+        # 圆圈编号
+        steps.append(f'''
+s.addShape(pres.shapes.OVAL, {{
+    x: {sx + step_w/2 - 0.25}, y: 1.4, w: 0.5, h: 0.5,
+    fill: {{ color: C.primary }}
+}});
+s.addText("{i+1}", {{
+    x: {sx + step_w/2 - 0.25}, y: 1.4, w: 0.5, h: 0.5,
+    fontSize: 18, fontFace: "{bf}", bold: true,
+    color: C.accent, align: "center", valign: "middle", margin: 0
+}});
+// 连接线
+if ({i} < {n-1}) {{
+s.addShape(pres.shapes.RECTANGLE, {{
+    x: {sx + step_w/2 + 0.3}, y: 1.6, w: {step_w - 0.3}, h: 0.04,
+    fill: {{ color: C.primary, transparency: 70 }}
+}});
+}}
+s.addText("{txt}", {{
+    x: {sx}, y: 2.2, w: {step_w}, h: 2.5,
+    fontSize: 14, fontFace: "{bf}",
+    color: C.text, valign: "top", wrap: true, margin: 0
+}});
+''')
+    steps_code = '\n'.join(steps)
+
+    return f'''
+(function(){{
+let s = pres.addSlide({{ masterName: "MASTER_SLIDE" }});
+s.addText("{t}", {{
+    x: 0.6, y: 0.15, w: 8.8, h: 0.6,
+    fontSize: 30, fontFace: "{hf}", bold: true,
+    color: C.primary, margin: 0
+}});
+{steps_code}
+// 底部装饰线
+s.addShape(pres.shapes.RECTANGLE, {{
+    x: 0.5, y: 5.2, w: 9, h: 0.02,
+    fill: {{ color: C.primary, transparency: 85 }}
+}});
+}})();
+'''
+
+
+# ── 图表页 ──
+def _gen_chart_slide(slide: dict, colors: dict, fonts: dict) -> str:
+    t = escape_js_string(slide.get('title', ''))
+    bullets = slide.get('bullets', [])
+    design = slide.get('design', {})
+    chart_data = design.get('chart', {}) or {}
+    hf = fonts['header']
+    bf = fonts['body']
+
+    # 解析图表数据
+    chart_type = chart_data.get('type', 'bar')
+    chart_title = escape_js_string(chart_data.get('title', ''))
+    labels = chart_data.get('labels', [])
+    datasets = chart_data.get('datasets', [])
+
+    # PPT图表类型映射
+    type_map = {
+        'bar': 'pres.charts.BAR',
+        'pie': 'pres.charts.PIE',
+        'line': 'pres.charts.LINE',
+        'doughnut': 'pres.charts.DOUGHNUT',
+    }
+    js_chart_type = type_map.get(chart_type, 'pres.charts.BAR')
+
+    # Chart系列数据
+    series = []
+    for ds in datasets:
+        name = escape_js_string(ds.get('name', ''))
+        vals = ds.get('values', [])
+        vals_str = ', '.join(str(v) for v in vals)
+        series.append(f'{{ name: "{name}", labels: [{", ".join(f"\"{escape_js_string(str(l))}\"" for l in labels)}], values: [{vals_str}] }}')
+    series_code = ', '.join(series)
+
+    # Chart配置
+    chart_cfg = f'chartColors: [C.primary, C.secondary, "{colors["accent"]}"]'
+    if chart_type in ('bar',):
+        chart_cfg += ', barDir: "col", showValue: true, dataLabelPosition: "outEnd"'
+    elif chart_type == 'pie':
+        chart_cfg += ', showPercent: true'
+    elif chart_type == 'line':
+        chart_cfg += ', lineSize: 3, lineSmooth: true'
+    chart_cfg += ', showLegend: false, catAxisLabelColor: C.textLight, valAxisLabelColor: C.textLight'
+
+    bf_code = ',\n        '.join(
+        [f'{{ text: "{escape_js_string(str(b))}", options: {{ bullet: true, breakLine: true, fontSize: 14, fontFace: "{bf}", color: C.text }} }}' for b in bullets]
+    ) if bullets else ''
+
+    # 有图表时调整布局
+    has_chart = bool(series_code and labels)
+
+    return f'''
+(function(){{
+let s = pres.addSlide({{ masterName: "MASTER_SLIDE" }});
+s.addText("{t}", {{
+    x: 0.6, y: 0.15, w: 8.8, h: 0.6,
+    fontSize: 30, fontFace: "{hf}", bold: true,
+    color: C.primary, margin: 0
+}});
+''' + (f'''
+s.addChart({js_chart_type}, [{series_code}], {{
+    x: 0.5, y: 0.9, w: 5.5, h: 4.0,
+    showTitle: {"true" if chart_title else "false"}, title: "{chart_title}",
+    {chart_cfg},
+    chartArea: {{ fill: {{ color: "FFFFFF" }}, roundedCorners: true }},
+    valGridLine: {{ color: "E2E8F0", size: 0.5 }},
+    catGridLine: {{ style: "none" }}
+}});
+s.addText([
+    {bf_code}
+], {{
+    x: 6.3, y: 0.9, w: 3.3, h: 4.0,
+    valign: "top", paraSpaceAfter: 6
+}});
+''' if has_chart else f'''
+s.addText([
+    {bf_code}
+], {{
+    x: 0.7, y: 1.0, w: 8.6, h: 4.0,
+    valign: "top", paraSpaceAfter: 8
+}});
+''') + f'''
+// 底部装饰线
+s.addShape(pres.shapes.RECTANGLE, {{
+    x: 0.5, y: 5.2, w: 9, h: 0.02,
+    fill: {{ color: C.primary, transparency: 85 }}
+}});
+}})();
+'''
+
+
+async def generate_ppt_file(state: IMState) -> IMState:
+    """生成PPT文件（在用户确认内容后调用）"""
+    ppt_content = state.get("ppt_content")
+    
+    if not ppt_content:
+        logger.error("[ppt_generate_node] 缺少PPT内容，无法制作文件")
+        state["error"] = "缺少PPT内容，无法制作PPT文件"
+        return state
+    
+    try:
+        # 创建输出目录
+        output_dir = os.path.join(os.getcwd(), "output", "ppt")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 生成文件名
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_title = re.sub(r'[^\w\s-]', '', ppt_content.get('title', '未命名'))[:30]
+        output_filename = f"{safe_title}_{timestamp}.pptx"
+        output_path = os.path.join(output_dir, output_filename)
+        
+        # 生成JavaScript代码
+        js_code = generate_pptxgenjs_code(ppt_content, output_path)
+        
+        # 保存JS文件
+        js_path = os.path.join(tempfile.gettempdir(), f"ppt_gen_{timestamp}.js")
+        with open(js_path, 'w', encoding='utf-8') as f:
+            f.write(js_code)
+        
+        logger.info(f"[ppt_generate_node] JavaScript代码已生成: {js_path}")
+        
+        # 执行Node.js生成PPT
+        try:
+            # 设置环境变量确保UTF-8编码
+            env = os.environ.copy()
+            env['PYTHONIOENCODING'] = 'utf-8'
+            
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            env['NODE_PATH'] = os.path.join(project_root, 'node_modules')
+            result = subprocess.run(
+                ['node', js_path],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                encoding='utf-8',
+                errors='ignore',  # 忽略编码错误
+                env=env
+            )
+            
+            if result.returncode == 0:
+                logger.info(f"[ppt_generate_node] PPT文件生成成功: {output_path}")
+                state["messages"].append(f"[ppt_generate_node] ✅ PPT文件生成成功")
+                
+                # 更新状态
+                state["ppt_url"] = output_path
+                state["ppt_generation_completed"] = True
+                
+                # 存储PPT信息到delivery
+                if "delivery" not in state or state["delivery"] is None:
+                    state["delivery"] = {}
+                
+                state["delivery"]["ppt_info"] = {
+                    "ppt_id": f"ppt_{timestamp}",
+                    "file_path": output_path,
+                    "title": ppt_content.get('title', '未命名PPT'),
+                    "total_pages": ppt_content.get('total_pages', 0),
+                    "generated_at": datetime.now().isoformat()
+                }
+                
+            else:
+                error_msg = result.stderr or "未知错误"
+                logger.error(f"[ppt_generate_node] PPT生成失败: {error_msg}")
+                state["error"] = f"PPT文件生成失败: {error_msg}"
+                state["messages"].append(f"[ppt_generate_node] ❌ PPT生成失败: {error_msg}")
+                # 标记为完成以防止无限循环，但记录错误
+                state["ppt_generation_completed"] = True
+                state["ppt_generation_failed"] = True
+                
+        except subprocess.TimeoutExpired:
+            logger.error("[ppt_generate_node] PPT生成超时")
+            state["error"] = "PPT文件生成超时"
+            state["messages"].append("[ppt_generate_node] ❌ PPT生成超时")
+            state["ppt_generation_completed"] = True
+            state["ppt_generation_failed"] = True
+            
+        except FileNotFoundError:
+            logger.error("[ppt_generate_node] 未找到Node.js，尝试使用模拟模式")
+            # 降级到模拟模式
+            state["ppt_url"] = f"mock://{output_path}"
+            state["ppt_generation_completed"] = True
+            state["messages"].append("[ppt_generate_node] ⚠️ Node.js未安装，使用模拟模式")
+            
+            if "delivery" not in state or state["delivery"] is None:
+                state["delivery"] = {}
+            
+            state["delivery"]["ppt_info"] = {
+                "ppt_id": f"ppt_{timestamp}",
+                "file_path": output_path,
+                "title": ppt_content.get('title', '未命名PPT'),
+                "total_pages": ppt_content.get('total_pages', 0),
+                "mock": True,
+                "generated_at": datetime.now().isoformat()
+            }
+        
+        # 清理临时文件
+        try:
+            if os.path.exists(js_path):
+                os.remove(js_path)
+        except Exception as e:
+            logger.warning(f"[ppt_generate_node] 清理临时文件失败: {e}")
+        
+    except Exception as e:
+        logger.error(f"[ppt_generate_node] 制作PPT文件时出错: {e}")
+        state["error"] = f"制作PPT文件失败: {str(e)}"
+        state["messages"].append(f"[ppt_generate_node] ❌ PPT制作失败: {str(e)}")
+        # 标记为完成以防止无限循环
+        state["ppt_generation_completed"] = True
+        state["ppt_generation_failed"] = True
+    
+    return state
+
+
+# ============================================
+# 辅助功能函数
+# ============================================
+
+async def check_ppt_status_node(state: IMState) -> IMState:
+    """查询PPT生成状态节点"""
+    state["current_scene"] = "check_ppt_status_node"
+    
+    ppt_info = state.get("delivery", {}).get("ppt_info", {})
+    ppt_id = ppt_info.get("ppt_id", "")
+    
+    if not ppt_id:
+        state["messages"].append("[check_ppt_status_node] ❌ 未找到PPT信息")
+        return state
+    
+    # 检查文件是否存在
+    file_path = ppt_info.get("file_path", "")
+    if file_path and os.path.exists(file_path):
+        state["messages"].append(f"[check_ppt_status_node] ✅ PPT文件已生成")
+        state["messages"].append(f"[check_ppt_status_node] 文件路径: {file_path}")
+        state["messages"].append(f"[check_ppt_status_node] 页数: {ppt_info.get('total_pages', 'N/A')}")
+    else:
+        state["messages"].append(f"[check_ppt_status_node] ⏳ PPT正在生成中")
+    
+    return state
+
+
+def format_ppt_outline_for_display(ppt_outline: dict) -> str:
+    """格式化PPT大纲为用户友好的显示文本"""
+    return format_ppt_outline(ppt_outline)
+
+
+def format_ppt_content_for_display(ppt_content: dict) -> str:
+    """格式化PPT内容为用户友好的显示文本"""
+    return format_ppt_content(ppt_content)
+
+
+# ============================================
+# 导出
+# ============================================
+
+__all__ = [
+    "ppt_generate_node",
+    "generate_ppt_outline",
+    "generate_ppt_content",
+    "generate_ppt_file",
+    "check_ppt_status_node",
+    "format_ppt_outline",
+    "format_ppt_content",
+    "format_ppt_outline_for_display",
+    "format_ppt_content_for_display"
+]
+
+
+# ============================================
+# 测试代码
+# ============================================
+
+if __name__ == "__main__":
+    # 测试用例 - PPT生成流程
+    print("=" * 60)
+    print("测试用例: PPT生成节点")
+    print("=" * 60)
+    
+    test_state = IMState(
+        workflow_id="wf_ppt_001",
+        user_id="user_123",
+        user_input="帮我制作一个关于Q3产品战略的PPT",
+        source="feishu_im",
+        chat_id="test_chat",
+        messages=[],
+        intent={
+            "intent_type": "ppt_creation",
+            "topic": "Q3产品战略发布会",
+            "key_points": ["市场分析", "产品路线图", "技术架构升级", "团队介绍"],
+            "confidence": 0.95,
+            "additional_info": {
+                "ppt_type": "presentation",
+                "target_pages": 8
+            }
+        },
+        chat_context="用户需要制作一个面向内部团队的Q3产品战略发布会PPT，重点展示市场分析、产品规划和技术升级。"
+    )
+    
+    async def test_flow():
+        # Step 1: 生成大纲
+        print("\n>>> Step 1: 生成PPT大纲")
+        result = await ppt_generate_node(test_state)
+        
+        if result.get("error"):
+            print(f"错误: {result['error']}")
+            return
+        
+        ppt_outline = result.get("ppt_outline", {})
+        print(format_ppt_outline(ppt_outline))
+        print(f"\nneed_confirm: {result.get('need_confirm')}")
+        print(f"confirm_type: {result.get('confirm_type')}")
+        
+        # 模拟用户确认大纲
+        result["confirmed"] = True
+        result["need_confirm"] = False
+        
+        # Step 2: 生成内容
+        print("\n>>> Step 2: 生成PPT内容")
+        result = await ppt_generate_node(result)
+        
+        if result.get("error"):
+            print(f"错误: {result['error']}")
+            return
+        
+        ppt_content = result.get("ppt_content", {})
+        print(format_ppt_content(ppt_content))
+        print(f"\nneed_confirm: {result.get('need_confirm')}")
+        print(f"confirm_type: {result.get('confirm_type')}")
+        
+        # 模拟用户确认内容
+        result["confirmed"] = True
+        result["need_confirm"] = False
+        
+        # Step 3: 生成PPT文件
+        print("\n>>> Step 3: 制作PPT文件")
+        result = await ppt_generate_node(result)
+        
+        if result.get("error"):
+            print(f"错误: {result['error']}")
+            return
+        
+        print(f"\n✅ PPT生成完成!")
+        print(f"文件路径: {result.get('ppt_url')}")
+        print(f"完成状态: {result.get('ppt_generation_completed')}")
+    
+    asyncio.run(test_flow())

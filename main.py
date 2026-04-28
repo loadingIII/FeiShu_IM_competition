@@ -12,7 +12,7 @@ if __name__ == "__main__":
     initial_state = {
         "workflow_id": str(uuid.uuid4()),
         "user_id": "user_123",
-        "user_input": "@Agent-Pilot 帮我总结一下本周的群聊内容,不用生成文档,只生成一个PPT",
+        "user_input": "@Agent-Pilot 帮我准备一下明天的会议材料,主题是'AI在医疗领域的应用',需要包含PPT和文档",
         "source": "feishu_im",
         "chat_id": "oc_81881e331cd9d7f921771aa884b96742",
         "intent": None,

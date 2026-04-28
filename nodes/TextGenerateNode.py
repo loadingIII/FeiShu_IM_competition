@@ -164,6 +164,7 @@ async def text_generate_node(state: IMState) -> IMState:
         return state
     
     state["doc_outline"] = doc_outline
+    state["confirm_type"] = "doc_outline"  # 设置确认类型，用于ConfirmNode路由
     state["current_scene_before_confirm"] = "text_generate_node"  # 记录来源，用于ConfirmNode路由
     state["need_confirm"] = True
     state["confirmed"] = False  # 重置确认状态
@@ -211,7 +212,8 @@ async def generate_doc_content(state: IMState) -> IMState:
     # Step C4: 创建飞书文档并写入
     doc_url = await create_feishu_document(state, doc_content)
     state["doc_url"] = doc_url
-    
+    state["doc_generation_completed"] = True
+
     logger.info(f"[text_generate_node] 飞书文档创建完成: {doc_url}")
     state["messages"].append(f"[text_generate_node] 飞书文档创建完成，链接: {doc_url}")
     

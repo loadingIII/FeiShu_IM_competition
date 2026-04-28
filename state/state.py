@@ -23,35 +23,56 @@ class IMState(TypedDict):
     # 场景 B(任务理解与规划) 输出（不会被并行节点修改）
     task_plan: Optional[Dict]  # 完整任务执行计划：定义后续工作流执行路径
 
-    # 场景 C 输出(文档/白板生成与编辑)（C和D并行时可能同时更新，使用Annotated）
+    # ===== 文档生成相关状态 =====
+    # 文档大纲生成与确认
     doc_outline: Annotated[Optional[Dict], last_value]  # 生成的文档大纲，用于人工确认
+    doc_outline_feedback: Annotated[Optional[str], last_value]  # 用户对文档大纲的修改意见
+    doc_outline_confirmed: Annotated[bool, last_value]  # 文档大纲是否已确认
+    
+    # 文档内容生成与确认
     doc_content: Annotated[Optional[Dict], last_value]  # 完整文档结构化内容
+    doc_content_feedback: Annotated[Optional[str], last_value]  # 用户对文档内容的修改意见
+    doc_content_confirmed: Annotated[bool, last_value]  # 文档内容是否已确认
+    
+    # 文档最终产出
     doc_url: Annotated[str, last_value]  # 生成的飞书文档在线访问链接
-    outline_feedback: Annotated[Optional[str], last_value]  # 用户对大纲的修改意见，用于重新生成大纲
 
-    # 场景 D(PPT生成) 输出（C和D并行时可能同时更新，使用Annotated）
-    ppt_structure: Annotated[Optional[Dict], last_value]  # 生成的PPT结构大纲
-    ppt_content: Annotated[Optional[Dict], last_value]  # 完整PPT结构化内容
-    ppt_url: Annotated[str, last_value]  # 生成的飞书PPT在线访问链接
-    ppt_outline_feedback: Annotated[Optional[str], last_value]  # 用户对PPT大纲的修改意见，用于重新生成大纲
-    ppt_style_selected: Annotated[Optional[str], last_value]  # 用户选择的PPT风格
-    ppt_style_confirmed: Annotated[bool, last_value]  # 用户是否已确认风格选择
-    ppt_satisfaction_confirmed: Annotated[bool, last_value]  # 用户是否已确认PPT满意度
-    ppt_satisfaction_feedback: Annotated[Optional[str], last_value]  # 用户对PPT的修改意见
-    ppt_revision_count: Annotated[int, last_value]  # PPT修改次数，防止无限循环
+    # ===== PPT生成相关状态 =====
+    # PPT大纲生成与确认
+    ppt_outline: Annotated[Optional[Dict], last_value]  # 生成的PPT大纲，用于人工确认
+    ppt_outline_feedback: Annotated[Optional[str], last_value]  # 用户对PPT大纲的修改意见
+    ppt_outline_confirmed: Annotated[bool, last_value]  # PPT大纲是否已确认
+    
+    # PPT内容生成与确认
+    ppt_content: Annotated[Optional[Dict], last_value]  # PPT详细内容结构
+    ppt_content_feedback: Annotated[Optional[str], last_value]  # 用户对PPT内容的修改意见
+    ppt_content_confirmed: Annotated[bool, last_value]  # PPT内容是否已确认
+    
+    # PPT最终产出
+    ppt_url: Annotated[str, last_value]  # 生成的PPT在线访问链接
+    ppt_id: Annotated[Optional[str], last_value]  # PPT的ID，用于查询状态
 
-    # 场景 F(总结与交付) 输出（E之后执行，不会被并行修改）
+    # 场景 F(总结与交付) 输出
     delivery: Optional[Dict]  # 最终交付结果汇总：包含所有生成链接、执行总结
 
-    # 控制流（C和D并行时可能同时更新current_scene，使用Annotated）
+    # ===== 控制流字段 =====
     messages: Annotated[List[str], operator.add]  # 工作流执行日志，所有节点追加日志
     current_scene: Annotated[str, last_value]  # 当前正在执行的场景标识，用于状态追踪
-    current_scene_before_confirm: Annotated[Optional[str], last_value]  # 进入确认节点前的场景标识，用于确认后路由回正确节点
-    need_confirm: Annotated[bool, last_value]  # 控制是否进入人工确认节点的开关
-    confirmed: Annotated[bool, last_value]  # 用户确认结果：同意执行时为True
-    cancelled: Annotated[bool, last_value]  # 用户确认结果：取消任务时为True
-    error: Annotated[Optional[str], last_value]  # 异常信息存储：节点执行出错时写入
-
-    # 任务规划相关（用于重新规划时传递上下文）
+    current_scene_before_confirm: Annotated[Optional[str], last_value]  # 进入确认节点前的场景标识
+    
+    # 确认控制
+    need_confirm: Annotated[bool, last_value]  # 是否触发确认节点
+    confirmed: Annotated[bool, last_value]  # 用户是否确认
+    cancelled: Annotated[bool, last_value]  # 用户是否取消任务
+    confirm_type: Annotated[Optional[str], last_value]  # 确认类型标识
+    
+    # 错误处理
+    error: Annotated[Optional[str], last_value]  # 异常信息存储
+    
+    # 任务规划相关（用于重新规划）
     plan_feedback: Annotated[Optional[str], last_value]  # 用户对计划的修改意见
-    previous_plan: Annotated[Optional[Dict], last_value]  # 之前的任务计划，用于重新规划时参考
+    previous_plan: Annotated[Optional[Dict], last_value]  # 之前的任务计划
+    
+    # 执行追踪
+    doc_generation_completed: Annotated[bool, last_value]  # 文档生成是否已完成
+    ppt_generation_completed: Annotated[bool, last_value]  # PPT生成是否已完成
