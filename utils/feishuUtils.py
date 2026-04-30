@@ -199,5 +199,79 @@ class FeishuAPI:
             else:
                 raise Exception(f"创建文档块失败: {data.get('msg')} (错误码: {data.get('code')})")
 
+    async def send_text_message(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+        """发送文本消息到飞书
+        
+        Args:
+            receive_id: 接收者ID（群ID或用户ID）
+            text: 消息文本内容
+            receive_id_type: ID类型，可选 chat_id(群) / open_id(用户) / user_id / union_id / email
+            
+        Returns:
+            发送结果，包含 message_id
+        """
+        token = await self.get_tenant_access_token()
+        url = "https://open.feishu.cn/open-apis/im/v1/messages"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8"
+        }
+        
+        payload = {
+            "receive_id": receive_id,
+            "msg_type": "text",
+            "content": json.dumps({"text": text})
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                url, 
+                headers=headers, 
+                params={"receive_id_type": receive_id_type},
+                json=payload
+            )
+            data = response.json()
+            if data.get("code") == 0:
+                return data["data"]
+            else:
+                raise Exception(f"发送消息失败: {data.get('msg')} (错误码: {data.get('code')})")
+
+    async def send_interactive_card(self, receive_id: str, card_content: dict, receive_id_type: str = "chat_id") -> dict:
+        """发送交互式卡片消息
+        
+        Args:
+            receive_id: 接收者ID
+            card_content: 卡片内容配置
+            receive_id_type: ID类型
+            
+        Returns:
+            发送结果
+        """
+        token = await self.get_tenant_access_token()
+        url = "https://open.feishu.cn/open-apis/im/v1/messages"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8"
+        }
+        
+        payload = {
+            "receive_id": receive_id,
+            "msg_type": "interactive",
+            "content": json.dumps(card_content)
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                url,
+                headers=headers,
+                params={"receive_id_type": receive_id_type},
+                json=payload
+            )
+            data = response.json()
+            if data.get("code") == 0:
+                return data["data"]
+            else:
+                raise Exception(f"发送卡片消息失败: {data.get('msg')} (错误码: {data.get('code')})")
+
 
 feishu_api = FeishuAPI()

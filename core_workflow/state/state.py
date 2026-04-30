@@ -76,3 +76,7 @@ class IMState(TypedDict):
     # 执行追踪
     doc_generation_completed: Annotated[bool, last_value]  # 文档生成是否已完成
     ppt_generation_completed: Annotated[bool, last_value]  # PPT生成是否已完成
+
+    # 闲聊模式
+    chat_history: Annotated[Optional[List[Dict]], last_value]  # 聊天对话历史 [{role, content}]
+    chat_intent_detected: Annotated[Optional[str], last_value]  # 聊天中检测到的意图类型

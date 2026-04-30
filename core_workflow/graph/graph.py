@@ -10,6 +10,7 @@ from nodes.PPTGenerateNode import ppt_generate_node
 from nodes.MultiTerminalNode import multi_terminal_node
 from nodes.DeliveryNode import delivery_node
 from nodes.ConfirmNode import confirm_node
+from nodes.ChatNode import chat_node
 
 
 def get_task_plan_branch(state: IMState) -> str:
@@ -121,6 +122,40 @@ def route_after_plan(state: IMState) -> str:
     return "execute_doc"
 
 
+def route_after_router(state: IMState) -> str:
+    """意图识别后路由
+
+    根据意图识别结果决定下一步：
+    - clarification_needed / knowledge_qa → chat_node（闲聊引导）
+    - 其他明确意图 → plan_node（任务规划）
+    """
+    intent = state.get("intent", {})
+    if isinstance(intent, dict):
+        intent_type = intent.get("type", "")
+        confidence = intent.get("confidence", 1.0)
+    else:
+        intent_type = str(intent) if intent else ""
+        confidence = 1.0
+
+    # 低置信度或需要澄清/知识问答 → 进入闲聊模式
+    if intent_type in ("clarification_needed", "knowledge_qa") or confidence < 0.5:
+        return "chat"
+
+    return "plan"
+
+
+def route_after_chat(state: IMState) -> str:
+    """闲聊节点后路由
+
+    检查闲聊中是否检测到用户意图：
+    - 检测到意图 → 回到 router_node 重新解析
+    - 未检测到（超时/退出） → 结束工作流
+    """
+    if state.get("chat_intent_detected"):
+        return "router"
+    return "end"
+
+
 def route_after_doc_outline(state: IMState) -> str:
     """文档大纲生成后路由"""
     if state.get("need_confirm", False):
@@ -182,21 +217,33 @@ def build_workflow() -> StateGraph:
 
     # 添加节点
     graph.add_node("router_node", router_node)
+    graph.add_node("chat_node", chat_node)
     graph.add_node("plan_node", plan_node)
     graph.add_node("confirm_node", confirm_node)
     graph.add_node("multi_terminal_node", multi_terminal_node)
     graph.add_node("delivery_node", delivery_node)
-    
+
     # 文档生成节点
     graph.add_node("text_generate_node", text_generate_node)
     graph.add_node("generate_doc_content", generate_doc_content)
-    
+
     # PPT生成节点
     graph.add_node("ppt_generate_node", ppt_generate_node)
 
     # 定义入口
     graph.set_entry_point("router_node")
-    graph.add_edge("router_node", "plan_node")
+
+    # router_node → 闲聊/任务规划
+    graph.add_conditional_edges("router_node", route_after_router, {
+        "chat": "chat_node",
+        "plan": "plan_node",
+    })
+
+    # chat_node → 检测到意图则重新路由，否则结束
+    graph.add_conditional_edges("chat_node", route_after_chat, {
+        "router": "router_node",
+        "end": END,
+    })
 
     # plan_node → 任务计划确认或直接执行
     graph.add_conditional_edges("plan_node", route_after_plan, {
