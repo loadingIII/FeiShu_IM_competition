@@ -66,52 +66,41 @@ def is_ppt_needed(state: IMState) -> bool:
 
 def handle_confirm(state: IMState) -> str:
     """处理用户确认结果
-    
+
     根据确认类型和来源场景决定路由:
-    - task_plan确认: 确认后进入生成流程
     - doc_outline确认: 确认后生成内容
     - ppt_outline确认: 确认后生成PPT内容
     - ppt_content确认: 确认后制作PPT文件
     """
     if state.get("cancelled", False):
         return "end"
-    
+
     confirm_type = state.get("confirm_type", "")
-    
+
     if state.get("confirmed", True):
         # 用户已确认，根据确认类型执行下一步
-        if confirm_type == "task_plan":
-            # 根据任务计划决定执行哪个分支
-            branch = get_task_plan_branch(state)
-            if branch == "ppt":
-                return "execute_ppt"
-            return "execute_doc"
-        elif confirm_type == "doc_outline":
+        if confirm_type == "doc_outline":
             return "generate_doc_content"
         elif confirm_type == "ppt_outline":
-            # PPT大纲确认后，生成PPT内容
             return "generate_ppt_content"
         elif confirm_type == "ppt_content":
-            # PPT内容确认后，制作PPT文件
             return "generate_ppt_file"
         return "execute"
     else:
         # 用户要求修改
-        if confirm_type == "task_plan":
-            return "modify_plan"
-        elif confirm_type == "doc_outline":
+        if confirm_type == "doc_outline":
             return "modify_doc_outline"
         elif confirm_type == "ppt_outline":
             return "modify_ppt_outline"
         elif confirm_type == "ppt_content":
             return "modify_ppt_content"
-        return "modify_plan"
+        return "modify_doc_outline"
 
 
 def route_after_plan(state: IMState) -> str:
     """任务规划后路由
-    
-    生成任务计划后，先让用户确认计划，确认后再进入生成流程
+
+    生成任务计划后直接进入执行流程，无需用户确认
     """
     if state.get("need_confirm", False):
         return "confirm"
@@ -206,8 +195,8 @@ def build_workflow() -> StateGraph:
     """构建LangGraph工作流
 
     流程设计:
-    1. 意图识别 → 任务规划 → 任务计划确认
-    2. 任务计划确认后，根据计划执行:
+    1. 意图识别 → 任务规划（自动执行，无需确认）
+    2. 根据计划执行:
        - 仅文档生成(C): 大纲生成 → 大纲确认 → 内容生成 → 生成文档
        - 仅PPT生成(D): 大纲生成 → 大纲确认 → 内容生成 → 内容确认 → 制作文件
        - 文档+PPT(C+D): 先生成文档，完成后继续PPT生成流程
@@ -256,12 +245,9 @@ def build_workflow() -> StateGraph:
     graph.add_conditional_edges("confirm_node", handle_confirm, {
         "end": END,
         "execute": "text_generate_node",
-        "execute_doc": "text_generate_node",
-        "execute_ppt": "ppt_generate_node",
         "generate_doc_content": "generate_doc_content",
         "generate_ppt_content": "ppt_generate_node",  # PPT大纲确认后，继续生成内容
         "generate_ppt_file": "ppt_generate_node",     # PPT内容确认后，制作文件
-        "modify_plan": "plan_node",
         "modify_doc_outline": "text_generate_node",
         "modify_ppt_outline": "ppt_generate_node",    # 修改PPT大纲
         "modify_ppt_content": "ppt_generate_node",    # 修改PPT内容

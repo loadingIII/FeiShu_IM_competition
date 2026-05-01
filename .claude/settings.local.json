@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm init *)",
+      "Bash(npm install *)",
+      "Bash(python tests/test_ppt_generate.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python tests/test_ppt_generate.py)",
+      "Bash(python -c \"import sys; sys.stdout.reconfigure\\(encoding='utf-8'\\); exec\\(open\\('tests/test_ppt_generate.py','r',encoding='utf-8'\\).read\\(\\)\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 python -X utf8 tests/test_ppt_generate.py)",
+      "Bash(python -X utf8 -c ' *)",
+      "Bash(node debug_output.js)",
+      "Bash(node -e \"const fs = require\\('fs'\\); const c = fs.readFileSync\\('debug_output.js','utf8'\\); const m = c.match\\(/\\\\{\\\\{/g\\); console.log\\('Found:', m ? m.length : 0\\); if\\(m\\) console.log\\(c.slice\\(0, 3000\\)\\);\")",
+      "Bash(timeout 8 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000)",
+      "Bash(python -m json.tool)",
+      "Bash(curl -s http://localhost:8001/api/workflows)",
+      "Bash(python -m json.tool kill %1)",
+      "Bash(python *)"
+    ]
+  }
+}

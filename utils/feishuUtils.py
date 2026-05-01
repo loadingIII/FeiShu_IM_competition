@@ -253,11 +253,18 @@ class FeishuAPI:
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json; charset=utf-8"
         }
+
+        # 兼容 Card DSL 2.0 导出格式：
+        # 若传入 {"name": "...", "dsl": {...}, "variables": []}，消息接口实际需要 dsl 内容
+        if isinstance(card_content, dict) and "dsl" in card_content and isinstance(card_content["dsl"], dict):
+            card_payload = card_content["dsl"]
+        else:
+            card_payload = card_content
         
         payload = {
             "receive_id": receive_id,
             "msg_type": "interactive",
-            "content": json.dumps(card_content)
+            "content": json.dumps(card_payload, ensure_ascii=False)
         }
         
         async with httpx.AsyncClient() as client:

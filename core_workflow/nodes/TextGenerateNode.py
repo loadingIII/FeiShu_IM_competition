@@ -18,6 +18,79 @@ def extract_json(content: str) -> str:
     return content.strip()
 
 
+def _normalize_llm_content(content) -> str:
+    """将模型输出统一转为字符串"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (dict, list)):
+        return json.dumps(content, ensure_ascii=False)
+    return str(content or "")
+
+
+def _build_json_retry_prompt(stage_name: str, last_error: str, last_raw_content: str) -> str:
+    """构建 JSON 修复重试提示"""
+    if not last_raw_content.strip():
+        return (
+            f"上一次你在【{stage_name}】阶段返回了空内容。\n\n"
+            "请重新生成，严格遵守：\n"
+            "1) 只输出一个 JSON 对象，不要 markdown 代码块，不要额外解释。\n"
+            "2) 所有 key 和字符串值都使用双引号。\n"
+            "3) 不要使用尾随逗号。\n"
+        )
+    return (
+        f"上一次你在【{stage_name}】阶段的输出不是合法 JSON，解析错误：{last_error}\n\n"
+        "请修复并重新输出，严格遵守：\n"
+        "1) 只输出一个 JSON 对象，不要 markdown 代码块，不要额外解释。\n"
+        "2) 所有 key 和字符串值都使用双引号。\n"
+        "3) 字符串内部如果包含双引号，必须使用 \\\" 转义。\n"
+        "4) 多行文本请使用 \\n 表示换行，不要直接换行打断 JSON 字符串。\n"
+        "5) 不要使用尾随逗号。\n\n"
+        f"以下是上一次输出（请在语义尽量不变的前提下修复）：\n{last_raw_content}"
+    )
+
+
+async def _invoke_agent_with_json_retry(
+    agent,
+    base_messages: list,
+    stage_name: str,
+    max_attempts: int = 3,
+) -> dict:
+    """调用 Agent 并解析 JSON，失败时自动重试一次修复"""
+    last_error = None
+    last_raw_content = ""
+
+    for attempt in range(1, max_attempts + 1):
+        if attempt == 1:
+            messages = base_messages
+        else:
+            retry_prompt = _build_json_retry_prompt(stage_name, str(last_error), last_raw_content)
+            messages = [*base_messages, HumanMessage(content=retry_prompt)]
+
+        res = await agent.ainvoke({"messages": messages})
+        raw_content = _normalize_llm_content(res["messages"][-1].content)
+        last_raw_content = raw_content
+        logger.info(f"[text_generate_node] {stage_name} LLM返回内容长度: {len(raw_content)}")
+        if not raw_content.strip():
+            logger.error(f"[text_generate_node] {stage_name} LLM返回空内容(第{attempt}次)")
+            logger.error(f"[text_generate_node] {stage_name} 完整响应keys: {list(res.keys()) if isinstance(res, dict) else type(res)}")
+            logger.error(f"[text_generate_node] {stage_name} 消息数量: {len(res.get('messages', []))}")
+            for idx, msg in enumerate(res.get("messages", [])):
+                c = msg.content if hasattr(msg, "content") else str(msg)
+                logger.error(f"[text_generate_node] {stage_name} 消息[{idx}] type={type(msg).__name__} len={len(str(c))}")
+            last_error = ValueError("LLM返回空内容")
+            continue
+        json_content = extract_json(raw_content)
+
+        try:
+            return json.loads(json_content)
+        except json.JSONDecodeError as e:
+            last_error = e
+            logger.error(f"[text_generate_node] {stage_name} JSON解析失败(第{attempt}次): {e}")
+            logger.error(f"[text_generate_node] {stage_name} 原始内容前500字: {raw_content[:500]}")
+
+    raise ValueError(f"{stage_name} JSON解析失败，已重试 {max_attempts} 次: {last_error}")
+
+
 def format_doc_outline(doc_outline: dict) -> str:
     """格式化文档大纲为易读的文本"""
     lines = []
@@ -146,21 +219,22 @@ async def text_generate_node(state: IMState) -> IMState:
     # Step C1: 文档大纲生成
     messages = build_outline_messages(state)
 
-    # 根据是否有用户反馈选择不同的agent
-    if outline_feedback and doc_outline:
-        res = await outline_revision_agent.ainvoke({"messages": messages})
-    else:
-        res = await outline_agent.ainvoke({"messages": messages})
-    
-    raw_content = res["messages"][-1].content
-    json_content = extract_json(raw_content)
-    
     try:
-        doc_outline = json.loads(json_content)
-    except json.JSONDecodeError as e:
-        logger.error(f"[text_generate_node] JSON解析失败: {e}")
-        logger.error(f"[text_generate_node] 原始内容: {raw_content}")
-        state["error"] = f"大纲解析失败: {e}"
+        # 根据是否有用户反馈选择不同的agent
+        if outline_feedback and doc_outline:
+            doc_outline = await _invoke_agent_with_json_retry(
+                agent=outline_revision_agent,
+                base_messages=messages,
+                stage_name="文档大纲",
+            )
+        else:
+            doc_outline = await _invoke_agent_with_json_retry(
+                agent=outline_agent,
+                base_messages=messages,
+                stage_name="文档大纲",
+            )
+    except ValueError as e:
+        state["error"] = str(e)
         return state
     
     state["doc_outline"] = doc_outline
@@ -191,28 +265,27 @@ async def generate_doc_content(state: IMState) -> IMState:
     
     # Step C3: LLM逐节展开内容
     messages = build_content_messages(doc_outline, chat_context)
-    res = await content_agent.ainvoke({"messages": messages})
-    
-    raw_content = res["messages"][-1].content
-    json_content = extract_json(raw_content)
-    
+
     try:
-        doc_content = json.loads(json_content)
-    except json.JSONDecodeError as e:
-        logger.error(f"[text_generate_node] 内容JSON解析失败: {e}")
-        logger.error(f"[text_generate_node] 原始内容: {raw_content}")
-        state["error"] = f"文档内容解析失败: {e}"
+        doc_content = await _invoke_agent_with_json_retry(
+            agent=content_agent,
+            base_messages=messages,
+            stage_name="文档内容",
+        )
+    except ValueError as e:
+        state["error"] = str(e)
         return state
     
     state["doc_content"] = doc_content
-    
+
     logger.info(f"[text_generate_node] 文档内容生成完成: {doc_content.get('title')}")
     state["messages"].append(f"[text_generate_node] 文档内容生成完成")
-    
+
     # Step C4: 创建飞书文档并写入
     doc_url = await create_feishu_document(state, doc_content)
     state["doc_url"] = doc_url
     state["doc_generation_completed"] = True
+    state["need_confirm"] = False  # 内容生成完成，清除确认状态
 
     logger.info(f"[text_generate_node] 飞书文档创建完成: {doc_url}")
     state["messages"].append(f"[text_generate_node] 飞书文档创建完成，链接: {doc_url}")

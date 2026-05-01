@@ -3,31 +3,6 @@ from state.state import IMState
 from utils.logger_handler import logger
 
 
-def format_task_plan(task_plan: dict) -> str:
-    """格式化任务计划为易读的文本"""
-    lines = []
-    lines.append("=" * 50)
-    lines.append(f"[任务目标] {task_plan.get('goal', 'N/A')}")
-    lines.append("=" * 50)
-    
-    lines.append("\n[执行分支]")
-    branches = task_plan.get('branches', [])
-    for i, branch in enumerate(branches, 1):
-        lines.append(f"  {i}. 场景 {branch.get('scene', '?')} - {branch.get('action', 'N/A')}")
-        lines.append(f"     描述: {branch.get('description', 'N/A')}")
-        lines.append(f"     触发: {'是' if branch.get('trigger') else '否'}")
-        lines.append(f"     需大纲确认: {'是' if branch.get('need_outline_confirm') else '否'}")
-        lines.append("")
-    
-    lines.append("[后续动作]")
-    post_actions = task_plan.get('post_actions', [])
-    for action in post_actions:
-        lines.append(f"  - 场景 {action.get('scene', '?')} - {action.get('action', 'N/A')}")
-    
-    lines.append("=" * 50)
-    return "\n".join(lines)
-
-
 def format_doc_outline(doc_outline: dict) -> str:
     """格式化文档大纲为易读的文本"""
     lines = []
@@ -136,17 +111,15 @@ async def confirm_node(state: IMState) -> IMState:
     - **CLI 模式**: 命令行交互，通过 input() 获取用户输入
 
     支持的确认场景:
-    1. 任务计划确认 (task_plan)
-    2. 文档大纲确认 (doc_outline)
-    3. PPT大纲确认 (ppt_outline)
-    4. PPT内容确认 (ppt_content)
+    1. 文档大纲确认 (doc_outline)
+    2. PPT大纲确认 (ppt_outline)
+    3. PPT内容确认 (ppt_content)
     """
     logger.info("[confirm_node] 进入确认节点")
     state["current_scene"] = "confirm_node"
     state["messages"].append("[confirm_node] 等待用户确认")
 
     # 判断当前需要确认的内容
-    task_plan = state.get("task_plan")
     doc_outline = state.get("doc_outline")
     ppt_outline = state.get("ppt_outline")
     ppt_content = state.get("ppt_content")
@@ -177,13 +150,6 @@ async def confirm_node(state: IMState) -> IMState:
         formatted = format_doc_outline(doc_outline)
         display_data = {"type": "doc_outline", "formatted": formatted, "data": doc_outline}
         item_name = "文档大纲"
-
-    # 任务计划确认
-    elif task_plan and current_scene == "plan_node":
-        formatted = format_task_plan(task_plan)
-        confirm_type = "task_plan"
-        display_data = {"type": "task_plan", "formatted": formatted, "data": task_plan}
-        item_name = "任务计划"
 
     else:
         logger.warning("[confirm_node] 没有可确认的内容")
@@ -248,17 +214,13 @@ async def confirm_node(state: IMState) -> IMState:
                 feedback = result.get("feedback", "")
                 if feedback:
                     key_map = {
-                        "task_plan": "plan_feedback",
                         "doc_outline": "outline_feedback",
                         "ppt_outline": "ppt_outline_feedback",
                         "ppt_content": "ppt_content_feedback",
                     }
-                    state_key = key_map.get(confirm_type, "plan_feedback")
+                    state_key = key_map.get(confirm_type, "outline_feedback")
                     state[state_key] = feedback
                     state["messages"].append(f"[confirm_node] 用户要求修改: {feedback}")
-
-                if confirm_type == "task_plan" and not result.get("confirmed"):
-                    state["previous_plan"] = task_plan
 
             return state
     except ImportError:
@@ -308,8 +270,6 @@ async def confirm_node(state: IMState) -> IMState:
                             state["ppt_outline_feedback"] = feedback
                         elif confirm_type == "ppt_content":
                             state["ppt_content_feedback"] = feedback
-                        else:
-                            state["plan_feedback"] = feedback
                         state["messages"].append(f"[confirm_node] 用户要求修改: {feedback}")
                     else:
                         feedback_msg = "用户未提供具体意见，请尝试生成不同的方案"
@@ -319,8 +279,6 @@ async def confirm_node(state: IMState) -> IMState:
                             state["ppt_outline_feedback"] = feedback_msg
                         elif confirm_type == "ppt_content":
                             state["ppt_content_feedback"] = feedback_msg
-                        else:
-                            state["plan_feedback"] = feedback_msg
                         state["messages"].append(f"[confirm_node] 用户要求修改，但未提供具体意见")
                 except (EOFError, KeyboardInterrupt):
                     feedback_msg = "用户未提供具体意见，请尝试生成不同的方案"
@@ -330,12 +288,7 @@ async def confirm_node(state: IMState) -> IMState:
                         state["ppt_outline_feedback"] = feedback_msg
                     elif confirm_type == "ppt_content":
                         state["ppt_content_feedback"] = feedback_msg
-                    else:
-                        state["plan_feedback"] = feedback_msg
                     state["messages"].append(f"[confirm_node] 用户要求修改(非交互环境)")
-
-                if confirm_type == "task_plan":
-                    state["previous_plan"] = task_plan
 
                 print(f"[重新生成] 正在根据您的意见重新生成{item_name}...")
                 break
