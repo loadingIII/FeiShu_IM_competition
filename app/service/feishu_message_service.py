@@ -351,11 +351,6 @@ class FeishuMessageService:
                                                         "tag": "plain_text"
                                                     },
                                                     "type": "primary_filled",
-                                                    "value": {
-                                                        "action": "confirm",
-                                                        "workflow_id": workflow_id,
-                                                        "confirm_type": confirm_type
-                                                    },
                                                     "width": "fill"
                                                 }
                                             ],
@@ -368,16 +363,7 @@ class FeishuMessageService:
                                         {
                                             "elements": [
                                                 {
-                                                    "behaviors": [
-                                                        {
-                                                            "type": "callback",
-                                                            "value": {
-                                                                "action": "show_modify_input",
-                                                                "workflow_id": workflow_id,
-                                                                "confirm_type": confirm_type
-                                                            }
-                                                        }
-                                                    ],
+                                                    "form_action_type": "submit",
                                                     "margin": "4px 0px 4px 0px",
                                                     "name": "modify_btn",
                                                     "tag": "button",
@@ -407,11 +393,6 @@ class FeishuMessageService:
                                                         "tag": "plain_text"
                                                     },
                                                     "type": "danger_filled",
-                                                    "value": {
-                                                        "action": "cancel",
-                                                        "workflow_id": workflow_id,
-                                                        "confirm_type": confirm_type
-                                                    },
                                                     "width": "fill"
                                                 }
                                             ],
@@ -497,7 +478,7 @@ class FeishuMessageService:
                     "tag": "div",
                     "text": {
                         "tag": "lark_md",
-                        "content": "**✅ 现在可以直接在聊天框输入修改意见了！**\n\n系统已智能识别当前有等待修改的工作流，**不会创建新任务**，请放心输入。\n\n**👇 操作步骤：**\n1. 点击底部的消息输入框（平时发消息的地方）\n2. 输入您的修改意见\n3. 直接发送消息即可\n\n**示例：**\n• 增加AI伦理相关章节\n• 删除第三部分内容\n• 把技术现状写得更详细\n• 调整章节顺序，把结论放前面"
+                        "content": "**✅ 请返回上方的确认卡片，在输入框中填写修改意见后点击【修改】按钮提交。**\n\n**示例：**\n• 增加AI伦理相关章节\n• 删除第三部分内容\n• 把技术现状写得更详细\n• 调整章节顺序，把结论放前面"
                     }
                 },
                 {"tag": "hr"},
@@ -516,6 +497,89 @@ class FeishuMessageService:
                     ]
                 }
             ]
+        }
+
+
+    def build_action_result_card(
+        self,
+        workflow_id: str,
+        action_type: str,
+        confirm_type: str = "",
+        extra_info: str = "",
+    ) -> Dict[str, Any]:
+        """构建操作结果卡片，用于替换原确认卡片"""
+        type_labels = {
+            "task_plan": "任务计划",
+            "doc_outline": "文档大纲",
+            "ppt_outline": "PPT大纲",
+            "ppt_content": "PPT内容",
+        }
+        type_label = type_labels.get(confirm_type, "内容")
+
+        action_config = {
+            "confirm": {
+                "header_template": "green",
+                "header_title": "✅ 已确认",
+                "icon": "check_circle_filled",
+                "icon_color": "#00B42A",
+                "status_text": f"**{type_label}已确认，正在继续执行...**",
+            },
+            "modify": {
+                "header_template": "orange",
+                "header_title": "✏️ 已提交修改",
+                "icon": "edit_filled",
+                "icon_color": "#FF7D00",
+                "status_text": f"**{type_label}修改意见已提交，正在重新生成...**"
+                    + (f"\n\n修改内容：{extra_info[:200]}" if extra_info else ""),
+            },
+            "cancel": {
+                "header_template": "red",
+                "header_title": "❌ 已取消",
+                "icon": "close_circle_filled",
+                "icon_color": "#F53F3F",
+                "status_text": f"**{type_label}任务已取消**",
+            },
+        }
+
+        cfg = action_config.get(action_type, action_config["confirm"])
+
+        elements = [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": cfg["status_text"],
+                },
+                "icon": {
+                    "tag": "standard_icon",
+                    "token": cfg["icon"],
+                    "color": cfg["icon_color"],
+                },
+            },
+            {"tag": "hr"},
+            {
+                "tag": "note",
+                "elements": [
+                    {
+                        "tag": "standard_icon",
+                        "token": "time_outlined",
+                        "color": "#86909C",
+                    },
+                    {
+                        "tag": "plain_text",
+                        "content": f" 操作时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    },
+                ],
+            },
+        ]
+
+        return {
+            "config": {"wide_screen_mode": True, "enable_forward": True},
+            "header": {
+                "template": cfg["header_template"],
+                "title": {"content": cfg["header_title"], "tag": "plain_text"},
+            },
+            "elements": elements,
         }
 
 

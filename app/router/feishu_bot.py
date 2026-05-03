@@ -1,6 +1,6 @@
 """
 飞书机器人 Webhook 回调处理
-处理飞书机器人推送的消息事件
+处理飞书机器人推送的消息事件和卡片交互
 """
 import json
 import hmac
@@ -9,6 +9,7 @@ import base64
 from datetime import datetime
 from fastapi import APIRouter, Request, HTTPException, Header
 from app.service import workflow_manager, chat_service
+from app.service.feishu_message_service import feishu_message_service
 from utils.feishuUtils import feishu_api
 from utils.logger_handler import logger
 
@@ -161,3 +162,154 @@ async def send_message_to_chat(chat_id: str, message: str, msg_type: str = "text
         else:
             logger.error(f"[FeishuBot] 消息发送失败: {data}")
             return {"success": False, "error": data.get("msg")}
+
+
+@router.post("/card-callback")
+async def feishu_card_callback(request: Request):
+    """处理飞书卡片交互回调
+
+    需要在飞书开发者后台配置卡片请求网址:
+    https://open.feishu.cn/app/{app_id}/botconf
+    """
+    body = await request.json()
+    logger.info(f"[FeishuBot] 卡片回调原始数据: {json.dumps(body, ensure_ascii=False, default=str)}")
+
+    # URL 验证
+    if body.get("type") == "url_verification":
+        challenge = body.get("challenge")
+        logger.info(f"[FeishuBot] 卡片回调 URL 验证, challenge: {challenge}")
+        return {"challenge": challenge}
+
+    try:
+        action = body.get("action", {})
+        action_value = action.get("value", {})
+        action_name = action.get("name", "")
+        form_value = action.get("form_value", {})
+        open_chat_id = body.get("open_chat_id", "")
+        open_message_id = body.get("open_message_id", "")
+
+        action_type = action_value.get("action", "")
+        workflow_id = action_value.get("workflow_id", "") or form_value.get("workflow_id", "")
+        confirm_type = action_value.get("confirm_type", "") or form_value.get("confirm_type", "")
+
+        # 从 form_value 提取修改内容
+        feedback = ""
+        if isinstance(form_value, dict):
+            feedback = form_value.get("modify_content", "").strip()
+
+        # form submit 不携带按钮 value，通过按钮 name 判断操作类型
+        if not action_type:
+            if action_name == "confirm_btn":
+                action_type = "modify" if feedback else "confirm"
+            elif action_name == "modify_btn":
+                action_type = "modify"
+            elif action_name == "cancel_btn":
+                action_type = "cancel"
+
+        # 兼容 Card DSL 2.0：通过按钮 name 判断
+        if not action_type:
+            if action_name == "confirm_btn":
+                action_type = "modify" if feedback else "confirm"
+            elif action_name == "modify_btn":
+                action_type = "modify"
+            elif action_name == "cancel_btn":
+                action_type = "cancel"
+
+        logger.info(
+            f"[FeishuBot] 收到卡片交互: action={action_type}, action_name={action_name}, "
+            f"workflow_id={workflow_id}, confirm_type={confirm_type}, "
+            f"feedback_length={len(feedback)}"
+        )
+
+        if not workflow_id:
+            # 尝试通过 message_id 查找
+            pending = feishu_message_service.get_pending_confirmation_by_message_id(open_message_id)
+            if pending:
+                workflow_id = pending.get("workflow_id", "")
+                confirm_type = pending.get("confirm_type", confirm_type)
+
+        if not workflow_id:
+            return {"toast": {"type": "error", "content": "无法识别工作流，请刷新后重试"}}
+
+        # ---------- 确认操作 ----------
+        if action_type == "confirm":
+            try:
+                success = await workflow_manager.submit_confirmation(
+                    workflow_id=workflow_id, confirmed=True, feedback=""
+                )
+                if not success:
+                    raise RuntimeError("确认提交失败")
+                feishu_message_service.clear_pending_confirmation(workflow_id)
+                card = feishu_message_service.build_action_result_card(
+                    workflow_id, "confirm", confirm_type
+                )
+                return {
+                    "toast": {"type": "success", "content": "✅ 已确认，正在继续执行..."},
+                    "card": {"type": "raw", "data": card},
+                }
+            except Exception as e:
+                logger.error(f"[FeishuBot] 确认操作失败: {e}")
+                return {"toast": {"type": "error", "content": f"确认失败: {e}"}}
+
+        # ---------- 取消操作 ----------
+        elif action_type == "cancel":
+            try:
+                success = await workflow_manager.submit_confirmation(
+                    workflow_id=workflow_id, confirmed=False, feedback=""
+                )
+                if not success:
+                    raise RuntimeError("取消提交失败")
+                feishu_message_service.clear_pending_confirmation(workflow_id)
+                card = feishu_message_service.build_action_result_card(
+                    workflow_id, "cancel", confirm_type
+                )
+                return {
+                    "toast": {"type": "success", "content": "❌ 已取消任务"},
+                    "card": {"type": "raw", "data": card},
+                }
+            except Exception as e:
+                logger.error(f"[FeishuBot] 取消操作失败: {e}")
+                return {"toast": {"type": "error", "content": f"取消失败: {e}"}}
+
+        # ---------- 修改操作 ----------
+        elif action_type in ("modify", "show_modify_input"):
+            if not feedback:
+                return {"toast": {"type": "warning", "content": "✏️ 请先在输入框填写修改内容，再点击【修改】提交"}}
+
+            if len(feedback) > 5000:
+                return {"toast": {"type": "warning", "content": "✏️ 修改内容不能超过 5000 个字符"}}
+
+            import re
+            suspicious_patterns = [
+                (r'<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>', "包含脚本标签"),
+                (r'javascript:', "包含 JavaScript 协议"),
+                (r'on\w+\s*=', "包含事件处理器"),
+            ]
+            for pattern, desc in suspicious_patterns:
+                if re.search(pattern, feedback, re.IGNORECASE):
+                    return {"toast": {"type": "warning", "content": f"✏️ 输入内容不安全: {desc}，请重新输入"}}
+
+            try:
+                success = await workflow_manager.submit_confirmation(
+                    workflow_id=workflow_id, confirmed=False, feedback=feedback
+                )
+                if not success:
+                    raise RuntimeError("修改提交失败")
+                feishu_message_service.clear_pending_confirmation(workflow_id)
+                display_feedback = feedback[:50] + ("..." if len(feedback) > 50 else "")
+                card = feishu_message_service.build_action_result_card(
+                    workflow_id, "modify", confirm_type, extra_info=feedback
+                )
+                return {
+                    "toast": {"type": "success", "content": f"✏️ 已提交修改意见: {display_feedback}"},
+                    "card": {"type": "raw", "data": card},
+                }
+            except Exception as e:
+                logger.error(f"[FeishuBot] 修改操作失败: {e}")
+                return {"toast": {"type": "error", "content": f"修改失败: {e}"}}
+
+        return {"toast": {"type": "error", "content": "无效的操作请求"}}
+
+    except Exception as e:
+        logger.error(f"[FeishuBot] 处理卡片回调失败: {e}", exc_info=True)
+        return {"toast": {"type": "error", "content": "处理失败，请稍后重试"}}

@@ -155,3 +155,10 @@ curl -X POST "http://127.0.0.1:8000/workflows" \
 - `core_workflow/feishu_md/FEISHU_INTEGRATION_README.md`
 - `core_workflow/feishu_md/FEISHU_WS_README.md`
 
+## 在飞书中的使用
+发送需求,生成工作流
+![img.png](img/img.png)
+确认文档大纲
+![img_1.png](img/img_1.png)
+生成最终文档
+![img.png](img/img2.png)

@@ -153,17 +153,10 @@ class FeishuWSManager:
             feedback = feedback.strip() if isinstance(feedback, str) else ""
 
             action_type = action_value.get("action", "")
-            workflow_id = action_value.get("workflow_id", "")
-            confirm_type = action_value.get("confirm_type", "")
+            workflow_id = action_value.get("workflow_id", "") or form_value.get("workflow_id", "")
+            confirm_type = action_value.get("confirm_type", "") or form_value.get("confirm_type", "")
 
-            if not workflow_id:
-                message_id = self._extract_message_id(event)
-                pending = feishu_message_service.get_pending_confirmation_by_message_id(message_id)
-                if pending:
-                    workflow_id = pending.get("workflow_id", "")
-                    confirm_type = pending.get("confirm_type", confirm_type)
-
-            # 兼容 Card DSL 2.0：通过按钮 name 判断提交行为
+            # form submit 不携带按钮 value，通过按钮 name 判断操作类型
             if not action_type:
                 if action_name == "confirm_btn":
                     action_type = "modify" if feedback else "confirm"
@@ -171,6 +164,14 @@ class FeishuWSManager:
                     action_type = "modify"
                 elif action_name == "cancel_btn":
                     action_type = "cancel"
+
+            # form submit 也不携带 workflow_id，通过 message_id 查找待确认上下文
+            if not workflow_id:
+                message_id = self._extract_message_id(event)
+                pending = feishu_message_service.get_pending_confirmation_by_message_id(message_id)
+                if pending:
+                    workflow_id = pending.get("workflow_id", "")
+                    confirm_type = pending.get("confirm_type", confirm_type)
 
             logger.info(
                 f"[FeishuWS] 收到卡片交互: action={action_type}, action_name={action_name}, "
@@ -186,17 +187,22 @@ class FeishuWSManager:
 
             # ---------- 确认操作 ----------
             if action_type == "confirm":
+                logger.info(f"[FeishuWS] 开始执行确认回调: workflow_id={workflow_id}, loop={self._loop}")
                 future = asyncio.run_coroutine_threadsafe(
                     self._card_callback(workflow_id, "confirm", ""),
                     self._loop
                 )
                 try:
                     future.result(timeout=10)
+                    logger.info(f"[FeishuWS] 确认回调执行成功: workflow_id={workflow_id}")
                     feishu_message_service.clear_pending_confirmation(workflow_id)
                     return self._build_success_response("✅ 已确认，正在继续执行...")
                 except Exception as e:
-                    logger.error(f"[FeishuWS] 确认操作失败: {e}")
-                    return self._build_error_response(str(e))
+                    logger.error(f"[FeishuWS] 确认操作失败: {e}", exc_info=True)
+                    card = feishu_message_service.build_action_result_card(
+                        workflow_id, "confirm", confirm_type
+                    )
+                    return self._build_error_response(f"确认失败: {e}", card=card)
 
             # ---------- 取消操作 ----------
             elif action_type == "cancel":
@@ -207,10 +213,16 @@ class FeishuWSManager:
                 try:
                     future.result(timeout=10)
                     feishu_message_service.clear_pending_confirmation(workflow_id)
-                    return self._build_success_response("❌ 已取消任务")
+                    card = feishu_message_service.build_action_result_card(
+                        workflow_id, "cancel", confirm_type
+                    )
+                    return self._build_success_response("❌ 已取消任务", card=card)
                 except Exception as e:
                     logger.error(f"[FeishuWS] 取消操作失败: {e}")
-                    return self._build_error_response(str(e))
+                    card = feishu_message_service.build_action_result_card(
+                        workflow_id, "cancel", confirm_type
+                    )
+                    return self._build_error_response(f"取消失败: {e}", card=card)
 
             # ---------- 修改操作 ----------
             elif action_type == "modify":
@@ -242,10 +254,16 @@ class FeishuWSManager:
                     future.result(timeout=10)
                     feishu_message_service.clear_pending_confirmation(workflow_id)
                     display_feedback = feedback[:50] + ("..." if len(feedback) > 50 else "")
-                    return self._build_success_response(f"✏️ 已提交修改意见: {display_feedback}")
+                    card = feishu_message_service.build_action_result_card(
+                        workflow_id, "modify", confirm_type, extra_info=feedback
+                    )
+                    return self._build_success_response(f"✏️ 已提交修改意见: {display_feedback}", card=card)
                 except Exception as e:
                     logger.error(f"[FeishuWS] 修改操作失败: {e}")
-                    return self._build_error_response(str(e))
+                    card = feishu_message_service.build_action_result_card(
+                        workflow_id, "modify", confirm_type
+                    )
+                    return self._build_error_response(f"修改失败: {e}", card=card)
 
             # ---------- 显示修改输入框 ----------
             elif action_type == "show_modify_input":
@@ -258,10 +276,16 @@ class FeishuWSManager:
                         future.result(timeout=10)
                         feishu_message_service.clear_pending_confirmation(workflow_id)
                         display_feedback = feedback[:50] + ("..." if len(feedback) > 50 else "")
-                        return self._build_success_response(f"✏️ 已提交修改意见: {display_feedback}")
+                        card = feishu_message_service.build_action_result_card(
+                            workflow_id, "modify", confirm_type, extra_info=feedback
+                        )
+                        return self._build_success_response(f"✏️ 已提交修改意见: {display_feedback}", card=card)
                     except Exception as e:
                         logger.error(f"[FeishuWS] 修改操作失败: {e}")
-                        return self._build_error_response(str(e))
+                        card = feishu_message_service.build_action_result_card(
+                            workflow_id, "modify", confirm_type
+                        )
+                        return self._build_error_response(f"修改失败: {e}", card=card)
                 return self._build_warning_response("✏️ 请先在输入框填写修改内容，再点击【修改】提交")
 
             # ---------- 提交反馈（兼容旧卡片） ----------
@@ -278,10 +302,16 @@ class FeishuWSManager:
                 try:
                     future.result(timeout=10)
                     feishu_message_service.clear_pending_confirmation(workflow_id)
-                    return self._build_success_response(f"✏️ 已提交修改意见: {feedback[:50]}...")
+                    card = feishu_message_service.build_action_result_card(
+                        workflow_id, "modify", confirm_type, extra_info=feedback
+                    )
+                    return self._build_success_response(f"✏️ 已提交修改意见: {feedback[:50]}...", card=card)
                 except Exception as e:
                     logger.error(f"[FeishuWS] 修改操作失败: {e}")
-                    return self._build_error_response(str(e))
+                    card = feishu_message_service.build_action_result_card(
+                        workflow_id, "modify", confirm_type
+                    )
+                    return self._build_error_response(f"修改失败: {e}", card=card)
 
             return self._build_error_response("无效的操作请求")
 
@@ -291,7 +321,11 @@ class FeishuWSManager:
 
     def _extract_message_id(self, evt: Any) -> str:
         """从事件上下文提取消息ID（兼容不同SDK字段）"""
-        context = getattr(evt, "context", None)
+        # P2CardActionTrigger 的 context 在 evt.event.context 下
+        event_data = getattr(evt, "event", None)
+        context = getattr(event_data, "context", None) if event_data else None
+        if not context:
+            context = getattr(evt, "context", None)
         candidates = [
             getattr(context, "open_message_id", None) if context else None,
             getattr(context, "message_id", None) if context else None,
@@ -312,23 +346,26 @@ class FeishuWSManager:
             }
         }
 
-    def _build_success_response(self, message: str) -> P2CardActionTriggerResponse:
+    def _build_success_response(self, message: str, card: dict = None) -> P2CardActionTriggerResponse:
         """构建成功响应"""
-        return P2CardActionTriggerResponse({
-            "toast": {"type": "success", "content": message}
-        })
+        resp = {"toast": {"type": "success", "content": message}}
+        if card:
+            resp["card"] = card
+        return P2CardActionTriggerResponse(resp)
 
-    def _build_error_response(self, message: str) -> P2CardActionTriggerResponse:
+    def _build_error_response(self, message: str, card: dict = None) -> P2CardActionTriggerResponse:
         """构建错误响应"""
-        return P2CardActionTriggerResponse({
-            "toast": {"type": "error", "content": message}
-        })
+        resp = {"toast": {"type": "error", "content": message}}
+        if card:
+            resp["card"] = card
+        return P2CardActionTriggerResponse(resp)
 
-    def _build_warning_response(self, message: str) -> P2CardActionTriggerResponse:
+    def _build_warning_response(self, message: str, card: dict = None) -> P2CardActionTriggerResponse:
         """构建警告响应"""
-        return P2CardActionTriggerResponse({
-            "toast": {"type": "warning", "content": message}
-        })
+        resp = {"toast": {"type": "warning", "content": message}}
+        if card:
+            resp["card"] = card
+        return P2CardActionTriggerResponse(resp)
 
 
 
@@ -347,6 +384,79 @@ class FeishuWSManager:
             .register_p2_card_action_trigger(self._on_card_action_trigger)
             .build()
         )
+
+    def _patch_ws_client_card_handling(self, ws_client_module):
+        """猴子补丁：让 WS 客户端处理 CARD 类型消息（SDK 原生不支持）"""
+        import base64
+        import http
+        from lark_oapi.core.json import JSON
+        from lark_oapi.ws.model import Response
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            P2CardActionTrigger, P2CardActionTriggerResponse,
+        )
+
+        _original_handle_data_frame = ws_client_module.Client._handle_data_frame
+
+        async def _patched_handle_data_frame(self_client, frame):
+            hs = frame.headers
+            type_header = None
+            for h in hs:
+                if h.key == "type":
+                    type_header = h.value
+                    break
+
+            if type_header != "card":
+                return await _original_handle_data_frame(self_client, frame)
+
+            # 处理 CARD 消息
+            msg_id = None
+            trace_id = None
+            sum_ = None
+            seq = None
+            for h in hs:
+                if h.key == "message_id":
+                    msg_id = h.value
+                elif h.key == "trace_id":
+                    trace_id = h.value
+                elif h.key == "sum":
+                    sum_ = h.value
+                elif h.key == "seq":
+                    seq = h.value
+
+            pl = frame.payload
+            if sum_ and int(sum_) > 1:
+                pl = self_client._combine(msg_id, int(sum_), int(seq), pl)
+                if pl is None:
+                    return
+
+            resp = Response(code=http.HTTPStatus.OK)
+            try:
+                start = int(round(__import__('time').time() * 1000))
+
+                card_event = JSON.unmarshal(str(pl, "utf-8"), P2CardActionTrigger)
+                logger.info(f"[FeishuWS] CARD 事件已解析，开始处理...")
+                result = self._on_card_action_trigger(card_event)
+
+                end = int(round(__import__('time').time() * 1000))
+                header = hs.add()
+                header.key = "bizRT"
+                header.value = str(end - start)
+
+                if result is not None:
+                    resp_json = JSON.marshal(result)
+                    resp.data = base64.b64encode(resp_json.encode("utf-8"))
+                    logger.info(f"[FeishuWS] CARD 响应已生成，耗时 {end - start}ms, data={resp_json[:200]}")
+                else:
+                    logger.warning(f"[FeishuWS] CARD 处理返回 None")
+            except Exception as e:
+                logger.error(f"[FeishuWS] 处理 CARD 消息失败: {e}", exc_info=True)
+                resp = Response(code=http.HTTPStatus.INTERNAL_SERVER_ERROR)
+
+            frame.payload = JSON.marshal(resp).encode("utf-8")
+            await self_client._write_message(frame.SerializeToString())
+
+        ws_client_module.Client._handle_data_frame = _patched_handle_data_frame
+        logger.info("[FeishuWS] 已修补 WS 客户端，支持 CARD 消息处理")
 
     def _run_client(self):
         """在后台线程中运行客户端"""
@@ -382,6 +492,9 @@ class FeishuWSManager:
                 event_handler=self.event_handler,
                 log_level=lark_module.LogLevel.INFO,
             )
+
+            # 猴子补丁：让 WS 客户端处理 CARD 类型消息
+            self._patch_ws_client_card_handling(ws_client_module)
 
             logger.info("[FeishuWS] 后台线程中启动长连接客户端...")
             self.client.start()
