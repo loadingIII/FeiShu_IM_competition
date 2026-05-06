@@ -62,8 +62,16 @@ async def _send_delivery_notification(state: IMState, artifacts: list, topic: st
         message_lines = [f"✅ **{topic}** 任务已完成！\n"]
         
         for artifact in artifacts:
-            artifact_type = "📄 文档" if artifact["type"] == "doc" else "📊 PPT"
-            message_lines.append(f"{artifact_type}: [{artifact['title']}]({artifact['url']})")
+            if artifact["type"] == "doc":
+                message_lines.append(f"📄 文档: [{artifact['title']}]({artifact['url']})")
+            else:
+                ppt_url = artifact.get("url", "")
+                if ppt_url.startswith("mock://"):
+                    message_lines.append(f"📊 PPT: {artifact['title']}（模拟模式）")
+                elif ppt_url.startswith("http://") or ppt_url.startswith("https://"):
+                    message_lines.append(f"📊 PPT: [{artifact['title']}]({ppt_url})")
+                else:
+                    message_lines.append(f"📊 PPT: {artifact['title']}（文件已通过附件发送）")
         
         message_text = "\n".join(message_lines)
         

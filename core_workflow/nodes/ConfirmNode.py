@@ -1,3 +1,4 @@
+import asyncio
 import json
 from state.state import IMState
 from utils.logger_handler import logger
@@ -224,7 +225,7 @@ async def confirm_node(state: IMState) -> IMState:
 
             return state
     except ImportError:
-        pass  # 没有 app 模块，回退到 CLI 模式
+        logger.warning("[confirm_node] 未找到 app 模块，回退到 CLI 模式（注意：input() 会阻塞事件循环）")
 
     # ---------- CLI 模式：命令行交互 ----------
     print("\n" + display_data.get("formatted", ""))
@@ -236,7 +237,8 @@ async def confirm_node(state: IMState) -> IMState:
         print("  [3] 取消任务 - 结束当前工作流")
 
         try:
-            choice = input("\n请输入选项 (1/2/3): ").strip()
+            choice = await asyncio.to_thread(input, "\n请输入选项 (1/2/3): ")
+            choice = choice.strip()
 
             if choice == "1":
                 state["confirmed"] = True
@@ -262,7 +264,8 @@ async def confirm_node(state: IMState) -> IMState:
                     print("  例如：不需要生成PPT、文档要更详细、先确认大纲再生成 等")
 
                 try:
-                    feedback = input("\n您的意见: ").strip()
+                    raw = await asyncio.to_thread(input, "\n您的意见: ")
+                    feedback = raw.strip() if raw else ""
                     if feedback:
                         if confirm_type == "doc_outline":
                             state["outline_feedback"] = feedback

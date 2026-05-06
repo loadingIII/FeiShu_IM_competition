@@ -53,10 +53,3 @@ class ErrorResponse(BaseModel):
     detail: str
 
 
-class ChatRequest(BaseModel):
-    message: str = Field(..., description="用户发送的聊天消息", min_length=1, max_length=5000)
-
-
-class ChatResponse(BaseModel):
-    workflow_id: str
-    message: str = "消息已接收"

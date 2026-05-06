@@ -5,7 +5,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from app.router import workflow_router
 from app.router import feishu_bot
-from app.service import confirmation_service, ws_manager, workflow_manager, chat_service
+from app.service import confirmation_service, ws_manager, workflow_manager
 from app.service.feishu_ws_manager import feishu_ws_manager
 from utils.logger_handler import logger
 
@@ -22,39 +22,15 @@ Agent-Pilot AI 工作流 API
 
 async def handle_feishu_message(chat_id: str, sender_open_id: str, message: str):
     """处理飞书长连接收到的消息"""
-    logger.info(f"[FeishuWS] handle_feishu_message 被调用: chat_id={chat_id}, sender={sender_open_id}, message={message[:50]}...")
+    logger.info(f"[FeishuWS] handle_feishu_message: chat_id={chat_id}, sender={sender_open_id}, message={message[:50]}...")
     try:
-        # 获取或创建工作流
-        workflow_id = await get_or_create_workflow(chat_id, sender_open_id)
-        logger.info(f"[FeishuWS] get_or_create_workflow 返回: {workflow_id}")
-
-        if workflow_id:
-            # 检查工作流是否正在等待修改意见
-            from app.service.confirmation import confirmation_service
-            pending = confirmation_service.get_pending(workflow_id)
-            if pending:
-                # 工作流在等待确认，用户发送的消息视为修改意见
-                logger.info(f"[FeishuWS] 工作流 {workflow_id} 有待确认项，将消息作为修改意见提交")
-                await workflow_manager.submit_confirmation(
-                    workflow_id=workflow_id,
-                    confirmed=False,
-                    feedback=message
-                )
-                logger.info(f"[FeishuWS] 修改意见已提交到工作流 {workflow_id}")
-            else:
-                # 将消息提交给工作流
-                chat_service.submit_message(workflow_id, message)
-                logger.info(f"[FeishuWS] 消息已提交到工作流 {workflow_id}")
-        else:
-            # 如果没有活跃工作流，创建新工作流
-            logger.info(f"[FeishuWS] 没有活跃工作流，创建新工作流")
-            workflow_id = await workflow_manager.create_workflow(
-                user_input=message,
-                user_id=sender_open_id,
-                source="feishu_bot",
-                chat_id=chat_id,
-            )
-            logger.info(f"[FeishuWS] 创建新工作流 {workflow_id}")
+        await workflow_manager.handle_message(
+            user_input=message,
+            user_id=sender_open_id,
+            source="feishu_bot",
+            chat_id=chat_id,
+            sender_open_id=sender_open_id,
+        )
     except Exception as e:
         logger.error(f"[FeishuWS] 处理用户消息失败: {e}", exc_info=True)
 
@@ -156,22 +132,6 @@ def _validate_modify_feedback(feedback: str) -> str:
     return feedback
 
 
-async def get_or_create_workflow(chat_id: str, user_id: str) -> str:
-    """获取用户当前的活跃工作流，如果没有则返回 None"""
-    try:
-        workflows = await workflow_manager.list_workflows(limit=50)
-
-        for wf in workflows:
-            if (wf.get("user_id") == user_id and
-                wf.get("source") == "feishu_bot" and
-                wf.get("status") in ["running", "waiting_input", "awaiting_confirmation"]):
-                return wf.get("workflow_id")
-    except Exception as e:
-        logger.error(f"[FeishuWS] 获取工作流失败: {e}")
-
-    return None
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期：启动时开启 API 模式和飞书长连接"""
@@ -181,6 +141,16 @@ async def lifespan(app: FastAPI):
     # 启动飞书长连接客户端（如果配置了环境变量）
     import os
     if os.getenv("FEISHU_APP_ID") and os.getenv("FEISHU_APP_SECRET"):
+        # 获取机器人信息用于 @提及匹配
+        try:
+            from utils.feishuUtils import feishu_api
+            bot_info = await feishu_api.get_bot_info()
+            bot_open_id = bot_info.get("open_id", "")
+            feishu_ws_manager.bot_open_id = bot_open_id
+            logger.info(f"[FastAPI] 机器人 open_id: {bot_open_id}")
+        except Exception as e:
+            logger.warning(f"[FastAPI] 获取机器人信息失败: {e}")
+
         feishu_ws_manager.set_message_callback(handle_feishu_message)
         feishu_ws_manager.set_card_callback(handle_feishu_card_action)
         feishu_ws_manager.start(asyncio.get_event_loop())

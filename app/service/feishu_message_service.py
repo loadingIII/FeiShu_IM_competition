@@ -7,6 +7,7 @@
 """
 import json
 import asyncio
+import os
 from typing import Optional, Dict, Any
 from datetime import datetime
 
@@ -38,8 +39,29 @@ class FeishuMessageService:
             bool: 是否发送成功
         """
         try:
-            # 构建结果卡片
-            card = self._build_result_card(workflow_id, result)
+            ppt_uploaded = False
+
+            # 先上传PPT文件（如果存在），获取结果用于卡片展示
+            ppt_url = result.get("ppt_url", "")
+            if ppt_url and not ppt_url.startswith("mock://"):
+                try:
+                    file_name = os.path.basename(ppt_url)
+                    file_key = await feishu_api.upload_im_file(
+                        file_path=ppt_url,
+                        file_name=file_name,
+                    )
+                    await feishu_api.send_file_message(
+                        receive_id=chat_id,
+                        file_key=file_key,
+                        receive_id_type="chat_id",
+                    )
+                    ppt_uploaded = True
+                    logger.info(f"[FeishuMsg] PPT文件消息已发送: {workflow_id}")
+                except Exception as file_err:
+                    logger.warning(f"[FeishuMsg] PPT文件消息发送失败(不影响卡片): {file_err}")
+
+            # 构建结果卡片（传入文件上传结果）
+            card = self._build_result_card(workflow_id, result, ppt_uploaded=ppt_uploaded)
 
             # 发送卡片消息
             await feishu_api.send_interactive_card(
@@ -60,8 +82,8 @@ class FeishuMessageService:
                     text=f"工作流 {workflow_id[:8]}... 已完成，但结果展示失败",
                     receive_id_type="chat_id"
                 )
-            except:
-                pass
+            except Exception as send_err:
+                logger.warning(f"[FeishuMsg] 降级文本消息也失败: {send_err}")
             return False
 
     async def send_confirmation_card(
@@ -181,6 +203,7 @@ class FeishuMessageService:
         self,
         workflow_id: str,
         result: Dict[str, Any],
+        ppt_uploaded: bool = False,
     ) -> Dict[str, Any]:
         """构建工作流结果卡片"""
         # 从result中直接获取文档和PPT链接
@@ -188,6 +211,7 @@ class FeishuMessageService:
         ppt_url = result.get("ppt_url", "")
         doc_title = "生成的文档"
         ppt_title = "生成的PPT"
+        ppt_mock = ppt_url.startswith("mock://") if ppt_url else False
         
         # 尝试从delivery中获取标题和链接（delivery_node中组装的数据）
         delivery = result.get("delivery", {})
@@ -228,18 +252,32 @@ class FeishuMessageService:
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
-                    "content": f"**📄 文档结果**\n[{doc_title}]({doc_url})\n\n点击链接即可查看完整文档内容"
+                    "content": f"**📄 文档结果**\n[{doc_title}]({doc_url})"
                 }
             })
             elements.append({"tag": "hr"})
 
         # PPT结果
-        if ppt_url:
+        if ppt_url and ppt_mock:
             elements.append({
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
-                    "content": f"**📊 PPT结果**\n[{ppt_title}]({ppt_url})\n\n点击链接即可查看完整PPT内容"
+                    "content": f"**📊 PPT结果**\n{ppt_title}（模拟模式，未实际生成文件）"
+                }
+            })
+            elements.append({"tag": "hr"})
+        elif ppt_url:
+            ppt_text = f"**📊 PPT结果**\n{ppt_title}"
+            if ppt_uploaded:
+                ppt_text += "\n✅ PPT文件已作为附件发送，可在消息中查看和下载"
+            else:
+                ppt_text += "\n⚠️ PPT文件已生成，但上传到飞书失败，请联系管理员"
+            elements.append({
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": ppt_text
                 }
             })
             elements.append({"tag": "hr"})

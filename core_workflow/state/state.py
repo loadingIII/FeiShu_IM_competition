@@ -24,32 +24,17 @@ class IMState(TypedDict):
     task_plan: Optional[Dict]  # 完整任务执行计划：定义后续工作流执行路径
 
     # ===== 文档生成相关状态 =====
-    # 文档大纲生成与确认
     doc_outline: Annotated[Optional[Dict], last_value]  # 生成的文档大纲，用于人工确认
-    doc_outline_feedback: Annotated[Optional[str], last_value]  # 用户对文档大纲的修改意见
-    doc_outline_confirmed: Annotated[bool, last_value]  # 文档大纲是否已确认
-    
-    # 文档内容生成与确认
+    outline_feedback: Annotated[Optional[str], last_value]  # 用户对文档大纲的修改意见
     doc_content: Annotated[Optional[Dict], last_value]  # 完整文档结构化内容
-    doc_content_feedback: Annotated[Optional[str], last_value]  # 用户对文档内容的修改意见
-    doc_content_confirmed: Annotated[bool, last_value]  # 文档内容是否已确认
-    
-    # 文档最终产出
     doc_url: Annotated[str, last_value]  # 生成的飞书文档在线访问链接
 
     # ===== PPT生成相关状态 =====
-    # PPT大纲生成与确认
     ppt_outline: Annotated[Optional[Dict], last_value]  # 生成的PPT大纲，用于人工确认
     ppt_outline_feedback: Annotated[Optional[str], last_value]  # 用户对PPT大纲的修改意见
-    ppt_outline_confirmed: Annotated[bool, last_value]  # PPT大纲是否已确认
-    
-    # PPT内容生成与确认
     ppt_content: Annotated[Optional[Dict], last_value]  # PPT详细内容结构
     ppt_content_feedback: Annotated[Optional[str], last_value]  # 用户对PPT内容的修改意见
-    ppt_content_confirmed: Annotated[bool, last_value]  # PPT内容是否已确认
-    
-    # PPT最终产出
-    ppt_url: Annotated[str, last_value]  # 生成的PPT在线访问链接
+    ppt_url: Annotated[str, last_value]  # 生成的PPT本地文件路径
     ppt_id: Annotated[Optional[str], last_value]  # PPT的ID，用于查询状态
 
     # 场景 F(总结与交付) 输出
@@ -77,6 +62,5 @@ class IMState(TypedDict):
     doc_generation_completed: Annotated[bool, last_value]  # 文档生成是否已完成
     ppt_generation_completed: Annotated[bool, last_value]  # PPT生成是否已完成
 
-    # 闲聊模式
+    # 历史上下文
     chat_history: Annotated[Optional[List[Dict]], last_value]  # 聊天对话历史 [{role, content}]
-    chat_intent_detected: Annotated[Optional[str], last_value]  # 聊天中检测到的意图类型

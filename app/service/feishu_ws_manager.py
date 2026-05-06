@@ -28,6 +28,7 @@ class FeishuWSManager:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self.bot_open_id: str = ""
 
     def set_message_callback(self, callback: Callable):
         """设置消息接收回调函数
@@ -80,6 +81,20 @@ class FeishuWSManager:
                     logger.info(f"[FeishuWS] 过滤 @ 后的消息: text={text[:50]}...")
 
                     if text:
+                        # --- chat_type routing ---
+                        chat_type = message.chat_type
+
+                        if chat_type == "group":
+                            mentions = message.mentions or []
+                            is_mentioned = any(
+                                getattr(m, 'id', None) and getattr(m.id, 'open_id', None) == self.bot_open_id
+                                for m in mentions
+                            )
+
+                            if not is_mentioned:
+                                return
+                        # --- END chat_type routing ---
+
                         logger.info(f"[FeishuWS] 准备处理消息 from {sender_open_id}: {text[:50]}...")
                         # 异步执行回调
                         if self._message_callback and self._loop:
@@ -505,8 +520,8 @@ class FeishuWSManager:
             # 清理事件循环
             try:
                 loop.close()
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"[FeishuWS] 清理事件循环异常: {e}")
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         """启动长连接客户端（在后台线程中运行）

@@ -2,8 +2,9 @@ import uuid
 import asyncio
 import time
 import sys
+import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "core_workflow"))
 from state.state import IMState
@@ -14,6 +15,10 @@ from app.service.confirmation import confirmation_service
 from app.service.websocket import ws_manager
 from app.service.feishu_message_service import feishu_message_service
 from utils.logger_handler import logger
+from utils.feishuUtils import feishu_api
+from nodes.agent.llm.router_llms import router_llm
+from nodes.agent.chat_agent import chat_agent
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 
 NODE_TO_SCENE = {
@@ -36,6 +41,155 @@ class WorkflowManager:
 
     def __init__(self):
         confirmation_service.enable_api_mode()
+        self._chat_sessions: Dict[str, dict] = {}  # key: user标识, value: {chat_history, last_activity}
+
+    async def handle_message(
+        self,
+        user_input: str,
+        user_id: str,
+        source: str,
+        chat_id: str = "",
+        sender_open_id: str = "",
+    ) -> None:
+        """统一消息入口：轻量意图判断，闲聊直接回复，任务才创建工作流"""
+        try:
+            # 1. 检查是否有正在进行的 workflow 需要确认
+            active_wf = await self._find_active_workflow(user_id, source)
+            if active_wf:
+                pending = confirmation_service.get_pending(active_wf)
+                if pending:
+                    await self.submit_confirmation(
+                        workflow_id=active_wf,
+                        confirmed=False,
+                        feedback=user_input,
+                    )
+                    logger.info(f"[handle_message] 修改意见已提交到工作流 {active_wf}")
+                    return
+
+            # 2. 轻量意图判断
+            intent_result = await router_llm.ainvoke([HumanMessage(content=user_input)])
+            intent_text = intent_result.content.strip()
+
+            try:
+                intent = json.loads(intent_text) if isinstance(intent_text, str) else intent_text
+            except (json.JSONDecodeError, TypeError):
+                intent = {"intent_type": "clarification_needed", "confidence": 0.3}
+
+            intent_type = intent.get("intent_type", "clarification_needed")
+            confidence = intent.get("confidence", 0.0)
+
+            # 3. 闲聊/知识问答 → 直接用 chat_llm 回复
+            if intent_type in ("clarification_needed", "knowledge_qa") or confidence < 0.5:
+                await self._handle_chat(user_input, user_id, source, chat_id, sender_open_id)
+                return
+
+            # 4. 任务意图 → 创建工作流
+            await self.create_workflow(
+                user_input=user_input,
+                user_id=user_id,
+                source=source,
+                chat_id=chat_id,
+            )
+
+        except Exception as e:
+            logger.error(f"[handle_message] 处理消息失败: {e}", exc_info=True)
+
+    async def _handle_chat(
+        self,
+        user_input: str,
+        user_id: str,
+        source: str,
+        chat_id: str,
+        sender_open_id: str,
+    ) -> None:
+        """处理闲聊消息：用 chat_llm 回复，检测意图标记"""
+        session_key = f"{source}:{sender_open_id or user_id}"
+        session = self._chat_sessions.get(session_key, {"chat_history": [], "last_activity": 0})
+        chat_history = session["chat_history"]
+
+        chat_history.append({"role": "user", "content": user_input})
+
+        # 将 dict 历史转为 LangChain 消息对象
+        langchain_messages = []
+        for msg in chat_history[:-1]:
+            if msg["role"] == "user":
+                langchain_messages.append(HumanMessage(content=msg["content"]))
+            elif msg["role"] == "assistant":
+                langchain_messages.append(AIMessage(content=msg["content"]))
+
+        # 构建完整消息：system指令 + 历史 + 当前输入
+        system_prompt = """你是一个智能办公助手 Agent-Pilot 的闲聊 Agent。你的职责是与用户进行自然、友好的对话。
+
+## 你的能力
+
+1. **闲聊陪伴**：与用户聊天、回答问题、提供建议
+2. **意图引导**：在对话中温和地引导用户表达工作需求
+3. **可协助的工作类型**：
+   - 生成飞书文档（doc_creation）
+   - 制作演示文稿/PPT（ppt_creation）
+   - 整理会议纪要（meeting_summary）
+
+## 你的行为准则
+
+1. 始终保持友好、热情的态度
+2. 回复简洁自然，不要过于啰嗦
+3. 如果用户表达了明确的工作需求（写文档、做PPT、整理纪要等），请在回复结尾添加标记 `[INTENT_DETECTED: 意图类型]`
+4. 如果用户只是在闲聊，正常回复即可，不要强行引导
+5. 如果用户需求模糊，可以适当询问以澄清"""
+
+        messages = [SystemMessage(content=system_prompt)] + langchain_messages + [HumanMessage(content=user_input)]
+        result = await chat_agent.ainvoke({"messages": messages})
+        reply = result["messages"][-1].content.strip()
+
+        # 检查意图标记 [INTENT_DETECTED:xxx]
+        intent_marker = "[INTENT_DETECTED:"
+        if intent_marker in reply:
+            try:
+                start = reply.index(intent_marker) + len(intent_marker)
+                end = reply.index("]", start)
+                detected = reply[start:end].strip().lower()
+                reply = reply.replace(f"{intent_marker}{detected}]", "").strip()
+                logger.info(f"[handle_message] 闲聊中检测到意图: {detected}")
+                # 检测到任务意图 → 创建工作流
+                await self.create_workflow(
+                    user_input=user_input,
+                    user_id=user_id,
+                    source=source,
+                    chat_id=chat_id,
+                    chat_history=chat_history,
+                )
+                return
+            except (ValueError, IndexError):
+                pass
+
+        # 记录回复
+        chat_history.append({"role": "assistant", "content": reply})
+        self._chat_sessions[session_key] = {
+            "chat_history": chat_history[-20:],  # 保留最近20条
+            "last_activity": time.time(),
+        }
+
+        # 发送文本消息
+        if chat_id:
+            try:
+                await feishu_api.send_text_message(
+                    receive_id=chat_id, text=reply, receive_id_type="chat_id"
+                )
+            except Exception as e:
+                logger.warning(f"[handle_message] 发送闲聊回复失败: {e}")
+
+    async def _find_active_workflow(self, user_id: str, source: str) -> Optional[str]:
+        """查找用户当前活跃的工作流"""
+        try:
+            workflows = await self.list_workflows(limit=50)
+            for wf in workflows:
+                if (wf.get("user_id") == user_id and
+                    wf.get("source") == source and
+                    wf.get("status") in ["running", "waiting_input", "awaiting_confirmation"]):
+                    return wf.get("workflow_id")
+        except Exception as e:
+            logger.error(f"[handle_message] 查找活跃工作流失败: {e}")
+        return None
 
     async def create_workflow(
         self,
@@ -43,6 +197,7 @@ class WorkflowManager:
         user_id: str = "api_user",
         source: str = "h5",
         chat_id: str = "",
+        chat_history: Optional[list] = None,
     ) -> str:
         """创建工作流实例并启动执行"""
         workflow_id = str(uuid.uuid4())
@@ -57,19 +212,14 @@ class WorkflowManager:
             "chat_context": "",
             "task_plan": None,
             "doc_outline": None,
-            "doc_outline_feedback": None,
-            "doc_outline_confirmed": False,
+            "outline_feedback": None,
             "doc_content": None,
-            "doc_content_feedback": None,
-            "doc_content_confirmed": False,
             "doc_url": "",
-            "ppt_content": None,
-            "ppt_url": "",
             "ppt_outline": None,
             "ppt_outline_feedback": None,
-            "ppt_outline_confirmed": False,
+            "ppt_content": None,
             "ppt_content_feedback": None,
-            "ppt_content_confirmed": False,
+            "ppt_url": "",
             "ppt_id": None,
             "delivery": None,
             "messages": [],
@@ -84,8 +234,7 @@ class WorkflowManager:
             "previous_plan": None,
             "doc_generation_completed": False,
             "ppt_generation_completed": False,
-            "chat_history": [],
-            "chat_intent_detected": None,
+            "chat_history": chat_history or [],
         }
 
         instance = WorkflowInstance(workflow_id, initial_state)

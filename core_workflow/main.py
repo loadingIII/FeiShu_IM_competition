@@ -9,7 +9,7 @@ Agent-Pilot 入口
 import sys
 import uuid
 import asyncio
-from backend.core_workflow.graph.graph import build_workflow
+from graph.graph import build_workflow
 
 
 def run_cli():

@@ -5,14 +5,10 @@ from app.schema import (
     CreateWorkflowResponse,
     ConfirmRequest,
     ConfirmResponse,
-    ChatRequest,
-    ChatResponse,
     WorkflowInfo,
     WorkflowListResponse,
 )
-from app.service import workflow_manager, confirmation_service, ws_manager, chat_service
-import uuid
-import time
+from app.service import workflow_manager, confirmation_service, ws_manager
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
 
@@ -80,26 +76,6 @@ async def confirm_workflow(workflow_id: str, req: ConfirmRequest):
         status="cancelled" if cancelled else "running",
         message=msg,
     )
-
-
-@router.post("/{workflow_id}/chat", response_model=ChatResponse)
-async def chat_with_workflow(workflow_id: str, req: ChatRequest):
-    """向工作流发送聊天消息"""
-    instance = await workflow_manager.get_workflow(workflow_id)
-    if not instance:
-        raise HTTPException(status_code=404, detail=f"工作流 {workflow_id} 不存在")
-
-    user_msg = {
-        "id": f"msg_{uuid.uuid4().hex[:12]}",
-        "role": "user",
-        "content": req.message,
-        "timestamp": int(time.time() * 1000),
-    }
-
-    chat_service.submit_message(workflow_id, req.message)
-    await ws_manager.broadcast_chat_message(workflow_id, user_msg)
-
-    return ChatResponse(workflow_id=workflow_id)
 
 
 @router.post("/{workflow_id}/cancel", response_model=ConfirmResponse)

@@ -61,7 +61,6 @@ class WebSocketManager:
                 stale.add(ws)
         for ws in stale:
             self.disconnect(ws)
-        await self.broadcast(message)
 
     async def broadcast_workflow_created(self, workflow_id: str, data: dict):
         await self.broadcast_to_workflow(workflow_id, {

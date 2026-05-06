@@ -8,8 +8,9 @@ import hashlib
 import base64
 from datetime import datetime
 from fastapi import APIRouter, Request, HTTPException, Header
-from app.service import workflow_manager, chat_service
+from app.service import workflow_manager
 from app.service.feishu_message_service import feishu_message_service
+from app.service.feishu_ws_manager import feishu_ws_manager
 from utils.feishuUtils import feishu_api
 from utils.logger_handler import logger
 
@@ -69,13 +70,26 @@ async def feishu_webhook(
         msg_type = message.get("message_type")
         content = json.loads(message.get("content", "{}"))
         chat_id = message.get("chat_id")
+        chat_type = message.get("chat_type")
         sender_open_id = sender.get("sender_id", {}).get("open_id")
-        
+
         # 只处理文本消息
         if msg_type == "text":
             text = content.get("text", "").strip()
             logger.info(f"[FeishuBot] 收到消息 from {sender_open_id}: {text}")
-            
+
+            # --- chat_type routing ---
+            if chat_type == "group":
+                mentions = message.get("mentions", [])
+                bot_open_id = feishu_ws_manager.bot_open_id
+                is_mentioned = any(
+                    m.get("id", {}).get("open_id") == bot_open_id
+                    for m in mentions
+                )
+                if not is_mentioned:
+                    return {"code": 0, "msg": "ignored"}
+            # --- END chat_type routing ---
+
             # 处理用户消息
             await handle_user_message(
                 chat_id=chat_id,
@@ -88,38 +102,13 @@ async def feishu_webhook(
 
 async def handle_user_message(chat_id: str, sender_open_id: str, message: str):
     """处理用户发送的消息"""
-    
-    # 获取或创建工作流
-    workflow_id = await get_or_create_workflow(chat_id, sender_open_id)
-    
-    if workflow_id:
-        # 将消息提交给工作流
-        chat_service.submit_message(workflow_id, message)
-        logger.info(f"[FeishuBot] 消息已提交到工作流 {workflow_id}")
-    else:
-        # 如果没有活跃工作流，创建新工作流
-        workflow_id = await workflow_manager.create_workflow(
-            user_input=message,
-            user_id=sender_open_id,
-            source="feishu_bot",
-            chat_id=chat_id,
-        )
-        logger.info(f"[FeishuBot] 创建新工作流 {workflow_id}")
-
-
-async def get_or_create_workflow(chat_id: str, user_id: str) -> str:
-    """获取用户当前的活跃工作流，如果没有则返回 None"""
-    # 这里可以实现工作流状态管理逻辑
-    # 例如：检查用户是否有进行中的工作流
-    workflows = await workflow_manager.list_workflows(limit=50)
-    
-    for wf in workflows:
-        if (wf.get("user_id") == user_id and 
-            wf.get("source") == "feishu_bot" and
-            wf.get("status") in ["running", "waiting_input"]):
-            return wf.get("workflow_id")
-    
-    return None
+    await workflow_manager.handle_message(
+        user_input=message,
+        user_id=sender_open_id,
+        source="feishu_bot",
+        chat_id=chat_id,
+        sender_open_id=sender_open_id,
+    )
 
 
 @router.post("/send-message")

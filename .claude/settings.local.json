@@ -17,7 +17,10 @@
       "Bash(python *)",
       "WebSearch",
       "Bash(pip show *)",
-      "Bash(pip install *)"
+      "Bash(pip install *)",
+      "WebFetch(domain:open.feishu.cn)",
+      "WebFetch(domain:open.larksuite.com)",
+      "Bash(git checkout *)"
     ]
   }
 }

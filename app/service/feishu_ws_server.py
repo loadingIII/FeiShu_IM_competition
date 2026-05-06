@@ -28,47 +28,22 @@ load_dotenv()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.service.feishu_ws_client import FeishuWSClient
-from app.service import workflow_manager, chat_service
+from app.service import workflow_manager
 from utils.logger_handler import logger
 
 
 async def handle_user_message(chat_id: str, sender_open_id: str, message: str):
     """处理用户发送的消息"""
     try:
-        # 获取或创建工作流
-        workflow_id = await get_or_create_workflow(chat_id, sender_open_id)
-
-        if workflow_id:
-            # 将消息提交给工作流
-            chat_service.submit_message(workflow_id, message)
-            logger.info(f"[FeishuWS] 消息已提交到工作流 {workflow_id}")
-        else:
-            # 如果没有活跃工作流，创建新工作流
-            workflow_id = await workflow_manager.create_workflow(
-                user_input=message,
-                user_id=sender_open_id,
-                source="feishu_bot",
-                chat_id=chat_id,
-            )
-            logger.info(f"[FeishuWS] 创建新工作流 {workflow_id}")
+        await workflow_manager.handle_message(
+            user_input=message,
+            user_id=sender_open_id,
+            source="feishu_bot",
+            chat_id=chat_id,
+            sender_open_id=sender_open_id,
+        )
     except Exception as e:
         logger.error(f"[FeishuWS] 处理用户消息失败: {e}")
-
-
-async def get_or_create_workflow(chat_id: str, user_id: str) -> str:
-    """获取用户当前的活跃工作流，如果没有则返回 None"""
-    try:
-        workflows = await workflow_manager.list_workflows(limit=50)
-
-        for wf in workflows:
-            if (wf.get("user_id") == user_id and
-                wf.get("source") == "feishu_bot" and
-                wf.get("status") in ["running", "waiting_input"]):
-                return wf.get("workflow_id")
-    except Exception as e:
-        logger.error(f"[FeishuWS] 获取工作流失败: {e}")
-
-    return None
 
 
 def main():
